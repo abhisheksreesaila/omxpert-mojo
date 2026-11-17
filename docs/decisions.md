@@ -18,3 +18,4 @@
 - D-16 · -lzm on (n-gram/Engram rows on demand) for the Mojo runs, and the same flags for the control · frees ~29 GB of RAM for cold experts; the control shows the flags alone don't speed llama.cpp up · yes
 - D-17 · M5 proof checks recorded runs by default (FULL=1 reruns ~30 min of server runs) · keeps scripts/check usable; the scripts that produced the numbers are in ../scripts · yes
 - D-18 · M6 left FAILING with the evidence instead of redefining it · GOAL rules; the measured cold-union growth (3.62x at 5 tokens) makes its bar impossible on this data. Proposed replacement milestones (batched layer for prompts; MTP-drafted speculation) need the owner's nod since they change the plan · yes
+- D-19 · timing proofs (m1, m2, m4) wait for a quiet machine first (scripts/wait_quiet.sh) · a full check during heavy desktop load (load 26, Chrome ~11 cores) failed M2/M4 on speed while bits stayed identical; thresholds unchanged · yes

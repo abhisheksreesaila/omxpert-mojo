@@ -1,6 +1,6 @@
-{"cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  1839.885465 , "cpu_gbs":  16.696691497587324 }
-{"cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  1848.69028 , "cpu_gbs":  16.617169642932293 }
-{"cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  1897.4694550000002 , "cpu_gbs":  16.189983938371224 }
-{"cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  2019.266175 , "cpu_gbs":  15.213447528778616 }
-{"cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  1911.38109 , "cpu_gbs":  16.072148124056202 }
-{"layer": 4, "cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  2026.022285 , "cpu_gbs":  17.689835035550953 }
+{"cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  3516.925275 , "cpu_gbs":  8.734902677168767 }
+{"cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  3252.4386 , "cpu_gbs":  9.445220580028781 }
+{"cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  2943.984005 , "cpu_gbs":  10.434839302056602 }
+{"cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  3450.901695 , "cpu_gbs":  8.902021186088872 }
+{"cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  3616.93556 , "cpu_gbs":  8.49337774765332 }
+{"layer": 4, "cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  3651.794885 , "cpu_gbs":  9.814351881376274 }
