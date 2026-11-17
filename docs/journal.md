@@ -108,3 +108,15 @@ Every step kept the per-lane arithmetic order, so CPU/GPU stayed bit-identical t
   one-token path across Q4_K/Q5_1, Q5_K/Q8_0, Q4_K/Q8_0 layers.
 - In llama.cpp (OMX_PREFILL + batch): prompts 112 -> 190 tok/s (llama.cpp 227), decode 43.4. Prompt chunks are now
   bound by the CPU reading the chunk's cold experts; the GPU re-reads hot weights per token (~0.85 s per 512 tokens).
+- MTP + batched verify: 40.6 tok/s median (36.7-53.9; 52-54 where the draft is accepted 76%). Not yet above plain
+  decode (43.4): verify still ~2.4x the MoE work (hot experts overlap only 0.76 across 3 tokens, cold 0.8), and the
+  draft head's VRAM costs pins. Next: -otd to keep the draft head's experts on the CPU.
+- Long prompts (docs text, 8K tokens): Mojo 52-61 tok/s vs llama.cpp 136. Docs text routes away from the chat profile
+  (many more cold picks) and my batch path computed every cold pick on the CPU. llama.cpp uploads big-batch expert
+  weights to the GPU instead. Bigger chunks (2048) didn't help a CPU-bound path.
+- Dual cold path for batches >= 64 tokens (moe_chunk): routing on the GPU, one sync, the host splits the cold picks by
+  tokens per expert: the busiest experts (>= 3 tokens, up to OMX_NSTAGE = 96) are copied to pinned staging (parallel)
+  and DMA'd to a VRAM staging pool, then run by the same batch kernels (slot >= STAGE_BASE); the rest go to the CPU
+  pool at the same time. Still 425/425 bit-identical; uniformly routed 512-token chunk 9.1 -> 4.7 s.
+- Needle test fixed: raw /completion on a 26K-token doc ended at once (EOS) on every stack incl. stock; now uses
+  /v1/chat/completions with thinking off.

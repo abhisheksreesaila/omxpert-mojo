@@ -12,10 +12,11 @@ from std.atomic import Atomic
 from std.runtime import initialize_runtime
 from max.algorithm import parallelize
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
-from hybrid import router_kernel, N_EXPERTS, TOPK, MB_WORDS, DROWS
-from layer48 import topk_slots_kernel, gate_up_slots, down_slots, combine_res_kernel, router_batch_kernel, topk_batch_kernel, collect_cold_kernel, gate_up_batch, down_batch, wait_done_kernel, combine_batch_kernel, BW
+from hybrid import router_kernel, N_EXPERTS, TOPK, MB_WORDS, DROWS, MB_NCOLD, MB_SEQ
+from layer48 import topk_slots_kernel, gate_up_slots, down_slots, combine_res_kernel, router_batch_kernel, topk_batch_kernel, collect_cold_kernel, gate_up_batch, down_batch, wait_done_kernel, combine_batch_kernel, BW, remap_stage_kernel
 from gpu_moe import D_MODEL, D_FF, WARPS_PER_BLOCK, TPB
-from cpu_pool import PoolCtl, start_pool, join_pool, NW, RING, C_COLD, C_BUSY_NS, BMAXT, BMAXP
+from cpu_pool import PoolCtl, start_pool, join_pool, NW, RING, C_COLD, C_BUSY_NS, BMAXT_DEFAULT
+from std.os import getenv
 
 comptime NL = 48
 comptime PU8 = Pointer[UInt8, MutAnyOrigin]
@@ -47,6 +48,7 @@ struct Engine:
     var bufsf: List[DeviceBuffer[DType.float32]]
     var hosti: List[HostBuffer[DType.int32]]
     var hostf: List[HostBuffer[DType.float32]]
+    var host8: List[HostBuffer[DType.uint8]]
     @__allow_legacy_any_origin_fields
     var gp: Pointer[PU8, MutAnyOrigin]
     @__allow_legacy_any_origin_fields
@@ -71,6 +73,14 @@ struct Engine:
     var b: Pointer[PF32, MutAnyOrigin]      # per GPU (10 each): X, logits, w, ids, slots, h, s, y, total | host: hx, hy
     @__allow_legacy_any_origin_fields
     var bh: Pointer[PF32, MutAnyOrigin]
+    var bmaxt: Int
+    var nstage: Int
+    @__allow_legacy_any_origin_fields
+    var st: Pointer[PU8, MutAnyOrigin]     # per GPU: stage gate, up, down (device) | host pinned: gate, up, down (shared)
+    @__allow_legacy_any_origin_fields
+    var sth: Pointer[PU8, MutAnyOrigin]
+    @__allow_legacy_any_origin_fields
+    var stmap: Pointer[PI32, MutAnyOrigin]  # per GPU: stage_of device [512] | host pinned stage_of [512], host pinned count
     var step: Int
     var calls: Int
     var call_ns: Int
@@ -83,6 +93,7 @@ struct Engine:
         self.bufsf = List[DeviceBuffer[DType.float32]]()
         self.hosti = List[HostBuffer[DType.int32]]()
         self.hostf = List[HostBuffer[DType.float32]]()
+        self.host8 = List[HostBuffer[DType.uint8]]()
         self.gp = alloc[PU8](NL).as_unsafe_any_origin()
         self.upp = alloc[PU8](NL).as_unsafe_any_origin()
         self.dp = alloc[PU8](NL).as_unsafe_any_origin()
@@ -91,10 +102,17 @@ struct Engine:
         self.info = alloc[Int](NL * 5).as_unsafe_any_origin()
         self.g = alloc[PF32](2 * 9).as_unsafe_any_origin()
         self.sl = alloc[PI32](2 * 2).as_unsafe_any_origin()
+        var bm = getenv("OMX_BMAXT")
+        self.bmaxt = Int(bm) if bm.byte_length() > 0 else BMAXT_DEFAULT
         self.pool = alloc[PoolCtl](1).as_unsafe_any_origin()
-        self.pool.unsafe_write(PoolCtl())
+        self.pool.unsafe_write(PoolCtl(self.bmaxt))
         self.tids = alloc[UInt64](NW).as_unsafe_any_origin()
         self.b = alloc[PF32](2 * 10).as_unsafe_any_origin()
+        self.st = alloc[PU8](2 * 3).as_unsafe_any_origin()
+        self.sth = alloc[PU8](3).as_unsafe_any_origin()
+        self.stmap = alloc[PI32](2 + 2).as_unsafe_any_origin()
+        var ns = getenv("OMX_NSTAGE")
+        self.nstage = Int(ns) if ns.byte_length() > 0 else 96
         self.bh = alloc[PF32](2 * 2).as_unsafe_any_origin()
         self.step = 0
         self.calls = 0
@@ -217,17 +235,41 @@ struct Engine:
         # batch path buffers (prompt chunks, speculative verify): up to BMAXT tokens per call
         for gi in range(2):
             var ctx = self.ctx0 if gi == 0 else self.ctx1
+            var BMAXT = self.bmaxt
             var bsizes = [BMAXT * D_MODEL, BMAXT * N_EXPERTS, BMAXT * BW, BMAXT * BW, BMAXT * BW, BMAXT * TOPK * D_FF, BMAXT * TOPK * D_MODEL, BMAXT * D_MODEL, 16]
             for j in range(9):
                 var bb = ctx.enqueue_create_buffer[DType.float32](bsizes[j])
                 self.b[gi * 10 + j] = bb.unsafe_ptr().as_unsafe_any_origin()
                 self.bufsf.append(bb^)
             for j in range(2):
-                var hb = ctx.enqueue_create_host_buffer[DType.float32](BMAXT * D_MODEL)
+                var hb = ctx.enqueue_create_host_buffer[DType.float32](self.bmaxt * D_MODEL)
                 self.bh[gi * 2 + j] = hb.unsafe_ptr().as_unsafe_any_origin()
                 self.hostf.append(hb^)
-        var ba = self.ctx0.enqueue_create_host_buffer[DType.int32](1 + 3 * BMAXP)
-        var br = self.ctx0.enqueue_create_host_buffer[DType.float32](BMAXP * D_MODEL)
+        # staging pools for cold experts uploaded for a big batch (max expert sizes: Q5_K gate/up, Q8_0 down)
+        comptime GEB_MAX = 1126400
+        comptime DEB_MAX = 1740800
+        for gi in range(2):
+            var ctx = self.ctx0 if gi == 0 else self.ctx1
+            var sizes8 = [self.nstage * GEB_MAX, self.nstage * GEB_MAX, self.nstage * DEB_MAX]
+            for j in range(3):
+                var sb8 = ctx.enqueue_create_buffer[DType.uint8](max(sizes8[j], 1))
+                self.st[gi * 3 + j] = sb8.unsafe_ptr().as_unsafe_any_origin()
+                self.bufs8.append(sb8^)
+            var smap = ctx.enqueue_create_buffer[DType.int32](N_EXPERTS)
+            self.stmap[gi] = smap.unsafe_ptr().as_unsafe_any_origin()
+            self.bufs32.append(smap^)
+        var sizesh = [self.nstage * GEB_MAX, self.nstage * GEB_MAX, self.nstage * DEB_MAX]
+        for j in range(3):
+            var hb8 = self.ctx0.enqueue_create_host_buffer[DType.uint8](max(sizesh[j], 1))
+            self.sth[j] = hb8.unsafe_ptr().as_unsafe_any_origin()
+            self.hosti.append(self.ctx0.enqueue_create_host_buffer[DType.int32](1))   # keep list types simple
+            self.host8.append(hb8^)
+        var hmap = self.ctx0.enqueue_create_host_buffer[DType.int32](N_EXPERTS + 16)
+        self.stmap[2] = hmap.unsafe_ptr().as_unsafe_any_origin()
+        self.stmap[3] = hmap.unsafe_ptr().as_unsafe_any_origin() + N_EXPERTS
+        self.hosti.append(hmap^)
+        var ba = self.ctx0.enqueue_create_host_buffer[DType.int32](1 + 3 * self.bmaxt * TOPK)
+        var br = self.ctx0.enqueue_create_host_buffer[DType.float32](self.bmaxt * TOPK * D_MODEL)
         self.ctx0.synchronize()
         p[].barea = ba.unsafe_ptr().as_unsafe_any_origin()
         p[].bres = br.unsafe_ptr().as_unsafe_any_origin()
@@ -263,13 +305,14 @@ struct Engine:
             ctx.enqueue_function[topk_batch_kernel](self.b[B + 1], self.tp[l0], self.b[B + 2], self.b[B + 3].bitcast[Int32](), bsl, grid_dim=1, block_dim=N_EXPERTS)
             var dba = ctx.enqueue_create_host_buffer[DType.int32](1 + 3 * TOPK)
             ctx.synchronize()
-            ctx.enqueue_function[collect_cold_kernel](self.b[B + 3].bitcast[Int32](), dsp, Int64(1), dba.unsafe_ptr().as_unsafe_any_origin(), dmp, Int32(-3), self.b[B + 8].bitcast[Int32](), grid_dim=1, block_dim=32)
-            ctx.enqueue_function[gate_up_batch[0]](self.gp[l0], self.upp[l0], dsp, Int64(self.info[l0 * 5 + 1]), self.b[B + 0], self.b[B + 5],
+            ctx.enqueue_function[collect_cold_kernel](self.b[B + 3].bitcast[Int32](), dsp, Int64(1), dba.unsafe_ptr().as_unsafe_any_origin(), dmp, Int32(-3), self.b[B + 8].bitcast[Int32](), Int64(1), grid_dim=1, block_dim=32)
+            ctx.enqueue_function[gate_up_batch[0]](self.gp[l0], self.upp[l0], dsp, Int64(self.info[l0 * 5 + 1]), self.b[B + 0], self.b[B + 5], self.st[gi * 3 + 0], self.st[gi * 3 + 1],
                 grid_dim=ceildiv(TOPK * D_FF, WARPS_PER_BLOCK), block_dim=TPB)
-            ctx.enqueue_function[gate_up_batch[1]](self.gp[l0], self.upp[l0], dsp, Int64(self.info[l0 * 5 + 1]), self.b[B + 0], self.b[B + 5],
+            ctx.enqueue_function[gate_up_batch[1]](self.gp[l0], self.upp[l0], dsp, Int64(self.info[l0 * 5 + 1]), self.b[B + 0], self.b[B + 5], self.st[gi * 3 + 0], self.st[gi * 3 + 1],
                 grid_dim=ceildiv(TOPK * D_FF, WARPS_PER_BLOCK), block_dim=TPB)
-            ctx.enqueue_function[down_batch](self.dp[l0], Int64(0), dsp, Int64(self.info[l0 * 5 + 2]), self.b[B + 5], self.b[B + 6],
+            ctx.enqueue_function[down_batch](self.dp[l0], Int64(0), dsp, Int64(self.info[l0 * 5 + 2]), self.b[B + 5], self.b[B + 6], self.st[gi * 3 + 2],
                 grid_dim=D_MODEL // DROWS, block_dim=TOPK * 32)
+            ctx.enqueue_function[remap_stage_kernel](self.b[B + 3].bitcast[Int32](), dsp, self.stmap[gi], Int64(0), grid_dim=1, block_dim=32)
             ctx.enqueue_function[wait_done_kernel](dmp, self.b[B + 8].bitcast[Int32](), Int32(-3), grid_dim=1, block_dim=32)
             ctx.enqueue_function[combine_batch_kernel](self.b[B + 6], p[].bres, self.b[B + 2], dsp, self.b[B + 7],
                 grid_dim=D_MODEL // 256, block_dim=256)
@@ -320,7 +363,7 @@ struct Engine:
         read once by the CPU for all its tokens. Same bits as ntok calls of moe()."""
         var done = 0
         while done < ntok:
-            var T = min(BMAXT, ntok - done)
+            var T = min(self.bmaxt, ntok - done)
             self.moe_chunk(layer, x + done * D_MODEL, y + done * D_MODEL, T)
             done += T
 
@@ -330,30 +373,101 @@ struct Engine:
         var ctx = self.ctx0 if gi == 0 else self.ctx1
         var B = gi * 10
         var seq = Int32(self.step + 1)
-        self.pool[].steplayer[self.step & 4095] = layer
-        self.pool[].bx = x
+        var p = self.pool
+        p[].steplayer[self.step & 4095] = layer
+        p[].bx = x
         self.step += 1
         self.calls += T
         var mb = self.sl[gi * 2 + 1] + (Int(seq) % RING) * MB_WORDS
         var slots = self.b[B + 4].bitcast[Int32]()
+        var ids = self.b[B + 3].bitcast[Int32]()
         var total = self.b[B + 8].bitcast[Int32]()
+        var geb = self.info[layer * 5 + 1]
+        var deb = self.info[layer * 5 + 2]
+        var upload = T >= 64 and self.nstage > 0
         unsafe_memcpy(dest=self.bh[gi * 2 + 0], src=x, count=T * D_MODEL)
         ctx.enqueue_copy(self.b[B + 0], self.bh[gi * 2 + 0], T * D_MODEL)
         ctx.enqueue_function[router_batch_kernel](self.rp[layer], self.b[B + 0], self.b[B + 1], grid_dim=T * (N_EXPERTS // WARPS_PER_BLOCK), block_dim=TPB)
-        ctx.enqueue_function[topk_batch_kernel](self.b[B + 1], self.tp[layer], self.b[B + 2], self.b[B + 3].bitcast[Int32](), slots,
+        ctx.enqueue_function[topk_batch_kernel](self.b[B + 1], self.tp[layer], self.b[B + 2], ids, slots,
             grid_dim=T, block_dim=N_EXPERTS)
-        ctx.enqueue_function[collect_cold_kernel](self.b[B + 3].bitcast[Int32](), slots, Int64(T), self.pool[].barea, mb, seq, total,
+        ctx.enqueue_function[collect_cold_kernel](ids, slots, Int64(T), p[].barea, mb, seq, total, Int64(0 if upload else 1),
             grid_dim=1, block_dim=32)
+        if upload:
+            # dual path: the experts with the most tokens go to the GPU over PCIe, the rest to the CPU pool
+            ctx.synchronize()
+            var ba = p[].barea
+            var n = Int(ba[0])
+            var cnt = alloc[Int](N_EXPERTS)
+            for e in range(N_EXPERTS):
+                cnt[e] = 0
+            for i in range(n):
+                cnt[Int(ba[1 + 3 * i])] += 1
+            var smap = self.stmap[2]
+            for e in range(N_EXPERTS):
+                smap[e] = -1
+            var chosen = List[Int]()
+            var kmin = 3
+            while len(chosen) < self.nstage:      # greedy: most tokens first
+                var best = -1
+                var bc = kmin - 1
+                for e in range(N_EXPERTS):
+                    if smap[e] < 0 and cnt[e] > bc:
+                        bc = cnt[e]
+                        best = e
+                if best < 0:
+                    break
+                smap[best] = Int32(len(chosen))
+                chosen.append(best)
+            # the CPU's share: keep only picks of experts not uploaded
+            var m = 0
+            for i in range(n):
+                var e = Int(ba[1 + 3 * i])
+                if smap[e] < 0:
+                    ba[1 + 3 * m] = ba[1 + 3 * i]
+                    ba[2 + 3 * m] = ba[2 + 3 * i]
+                    ba[3 + 3 * m] = ba[3 + 3 * i]
+                    m += 1
+            ba[0] = Int32(m)
+            self.stmap[3][0] = Int32(m)
+            mb.unsafe_store[volatile=True](MB_NCOLD, Int32(-1) if m > 0 else Int32(0))
+            mb.unsafe_store[volatile=True](MB_SEQ, seq)       # the CPU pool starts now
+            var nc = len(chosen)
+            if nc > 0:
+                var gsrc = p[].gate[layer]
+                var usrc = p[].up[layer]
+                var dsrc = p[].down[layer]
+                var hg = self.sth[0]
+                var hu = self.sth[1]
+                var hd = self.sth[2]
+                var ch = alloc[Int](nc)
+                for i in range(nc):
+                    ch[i] = chosen[i]
+
+                def stage_copy(i: Int) {imm}:
+                    var e = ch[i]
+                    unsafe_memcpy(dest=hg + i * geb, src=gsrc + e * geb, count=geb)
+                    unsafe_memcpy(dest=hu + i * geb, src=usrc + e * geb, count=geb)
+                    unsafe_memcpy(dest=hd + i * deb, src=dsrc + e * deb, count=deb)
+
+                parallelize(stage_copy, nc)
+                ch.free()
+                ctx.enqueue_copy(self.st[gi * 3 + 0], self.sth[0], nc * geb)
+                ctx.enqueue_copy(self.st[gi * 3 + 1], self.sth[1], nc * geb)
+                ctx.enqueue_copy(self.st[gi * 3 + 2], self.sth[2], nc * deb)
+            ctx.enqueue_copy(self.stmap[gi], smap, N_EXPERTS)
+            ctx.enqueue_copy(total, self.stmap[3], 1)
+            ctx.enqueue_function[remap_stage_kernel](ids, slots, self.stmap[gi], Int64(T), grid_dim=ceildiv(T * TOPK, 256), block_dim=256)
+            cnt.free()
         if self.info[layer * 5 + 3] == 1:
-            ctx.enqueue_function[gate_up_batch[1]](self.gp[layer], self.upp[layer], slots, Int64(self.info[layer * 5 + 1]), self.b[B + 0], self.b[B + 5],
+            ctx.enqueue_function[gate_up_batch[1]](self.gp[layer], self.upp[layer], slots, Int64(geb), self.b[B + 0], self.b[B + 5], self.st[gi * 3 + 0], self.st[gi * 3 + 1],
                 grid_dim=ceildiv(T * TOPK * D_FF, WARPS_PER_BLOCK), block_dim=TPB)
         else:
-            ctx.enqueue_function[gate_up_batch[0]](self.gp[layer], self.upp[layer], slots, Int64(self.info[layer * 5 + 1]), self.b[B + 0], self.b[B + 5],
+            ctx.enqueue_function[gate_up_batch[0]](self.gp[layer], self.upp[layer], slots, Int64(geb), self.b[B + 0], self.b[B + 5], self.st[gi * 3 + 0], self.st[gi * 3 + 1],
                 grid_dim=ceildiv(T * TOPK * D_FF, WARPS_PER_BLOCK), block_dim=TPB)
-        ctx.enqueue_function[down_batch](self.dp[layer], Int64(self.info[layer * 5 + 4]), slots, Int64(self.info[layer * 5 + 2]), self.b[B + 5], self.b[B + 6],
+        ctx.enqueue_function[down_batch](self.dp[layer], Int64(self.info[layer * 5 + 4]), slots, Int64(deb), self.b[B + 5], self.b[B + 6], self.st[gi * 3 + 2],
             grid_dim=T * (D_MODEL // DROWS), block_dim=TOPK * 32)
         ctx.enqueue_function[wait_done_kernel](mb, total, seq, grid_dim=1, block_dim=32)
-        ctx.enqueue_function[combine_batch_kernel](self.b[B + 6], self.pool[].bres, self.b[B + 2], slots, self.b[B + 7],
+        ctx.enqueue_function[combine_batch_kernel](self.b[B + 6], p[].bres, self.b[B + 2], slots, self.b[B + 7],
             grid_dim=T * (D_MODEL // 256), block_dim=256)
         ctx.enqueue_copy(self.bh[gi * 2 + 1], self.b[B + 7], T * D_MODEL)
         ctx.synchronize()

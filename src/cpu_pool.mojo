@@ -16,8 +16,7 @@ from hybrid import TOPK, MB_SEQ, MB_DONE, MB_NCOLD, MB_SLOT, MB_ID, MB_X, MB_S, 
 comptime NW = 12
 comptime NLMAX = 64
 comptime RING = 16
-comptime BMAXT = 512            # tokens per batch call
-comptime BMAXP = BMAXT * TOPK    # picks per batch call
+comptime BMAXT_DEFAULT = 512    # tokens per batch call (OMX_BMAXT overrides, see omx_lib)
 
 # control words (Int64)
 comptime C_GEN = 0       # job generation: worker 0 bumps it to release the others
@@ -106,7 +105,12 @@ struct PoolCtl:
     @__allow_legacy_any_origin_fields
     var hv_all: Pointer[Float32, MutAnyOrigin]
 
-    def __init__(out self):
+    var bmaxt: Int
+
+    def __init__(out self, bmaxt: Int = BMAXT_DEFAULT):
+        self.bmaxt = bmaxt
+        var BMAXT = bmaxt
+        var BMAXP = bmaxt * TOPK
         self.ctl = alloc[Int64](64).as_unsafe_any_origin()
         for i in range(64):
             self.ctl[i] = 0
@@ -261,8 +265,8 @@ def setup_batch(p: Pointer[PoolCtl, MutAnyOrigin], l: Int):
             p[].g_cnt[ng] = cnt[e]
             ng += 1
         acc += cnt[e]
-    var need = alloc[Int](BMAXT)
-    for t in range(BMAXT):
+    var need = alloc[Int](p[].bmaxt)
+    for t in range(p[].bmaxt):
         need[t] = -1
     var nt = 0
     for i in range(n):
@@ -306,8 +310,8 @@ def do_batch_job(p: Pointer[PoolCtl, MutAnyOrigin], w: Int, mut round: Int64):
         permute_x_q4k(p[].bx + p[].b_toks[i] * D_MODEL, p[].xp_all + i * D_MODEL, D_MODEL)
     pool_barrier(p[].ctl, round)
     # A: gate/up, units = (group, row)
-    var g_buf = alloc[Float32](BMAXT)
-    var u_buf = alloc[Float32](BMAXT)
+    var g_buf = alloc[Float32](p[].bmaxt)
+    var u_buf = alloc[Float32](p[].bmaxt)
     var na = ng * D_FF
     for unit in range(w * na // NW, (w + 1) * na // NW):
         var j = unit // D_FF

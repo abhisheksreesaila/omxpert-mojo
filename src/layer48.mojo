@@ -279,6 +279,7 @@ def topk_slots_kernel(
 # Token t's arrays live at [t * stride]. The CPU gets one request per batch: a list of (expert, token, slot) cold
 # picks in the batch area; it reads each cold expert once and writes results to bres[t][slot][:].
 comptime BW = 16   # words per token in the per-token small arrays (ids 0..9, slots 0..10)
+comptime STAGE_BASE = 1 << 20   # slot values >= this point into the staging pool (cold experts uploaded for a big batch)
 
 
 def router_batch_kernel(wr: Pointer[Float32, ImmutAnyOrigin], x: Pointer[Float32, ImmutAnyOrigin], logits: Pointer[Float32, MutAnyOrigin]):
@@ -363,7 +364,7 @@ def topk_batch_kernel(logits: Pointer[Float32, ImmutAnyOrigin], res: Pointer[Int
 
 def collect_cold_kernel(ids: Pointer[Int32, ImmutAnyOrigin], slots: Pointer[Int32, ImmutAnyOrigin], ntok: Int64,
                         barea: Pointer[Int32, MutAnyOrigin], mb: Pointer[Int32, MutAnyOrigin], seq: Int32,
-                        total: Pointer[Int32, MutAnyOrigin]):
+                        total: Pointer[Int32, MutAnyOrigin], post: Int64):
     """One thread: list every cold pick (expert, token, slot) into the pinned batch area, then post the request.
     barea[0] = count, then triples. Posts NCOLD = -1 (batch request) or 0 (nothing cold) and the sequence number."""
     if thread_idx.x != 0:
@@ -379,15 +380,18 @@ def collect_cold_kernel(ids: Pointer[Int32, ImmutAnyOrigin], slots: Pointer[Int3
                     n += 1
     barea.unsafe_store[volatile=True](0, Int32(n))
     total[0] = Int32(n)
-    mb.unsafe_store[volatile=True](MB_NCOLD, Int32(-1) if n > 0 else Int32(0))
     threadfence[Scope.SYSTEM]()
-    mb.unsafe_store[volatile=True](MB_SEQ, seq)
+    if post == 1:
+        mb.unsafe_store[volatile=True](MB_NCOLD, Int32(-1) if n > 0 else Int32(0))
+        threadfence[Scope.SYSTEM]()
+        mb.unsafe_store[volatile=True](MB_SEQ, seq)
 
 
 def gate_up_batch[GT: Int](
     gate: Pointer[UInt8, ImmutAnyOrigin], up: Pointer[UInt8, ImmutAnyOrigin],
     slots: Pointer[Int32, ImmutAnyOrigin], expert_bytes_: Int64,
     x: Pointer[Float32, ImmutAnyOrigin], h: Pointer[Float32, MutAnyOrigin],
+    sgate: Pointer[UInt8, ImmutAnyOrigin], sup: Pointer[UInt8, ImmutAnyOrigin],
 ):
     """One warp per (token, slot, row) for hot slots; h[t][e][r]. Same per-lane math as gate_up_slots."""
     var expert_bytes = Int(expert_bytes_)
@@ -400,6 +404,12 @@ def gate_up_batch[GT: Int](
     var sl = Int(slots[tok * BW + e])
     if sl < 0:
         return
+    var gbase = gate
+    var ubase = up
+    if sl >= STAGE_BASE:
+        sl -= STAGE_BASE
+        gbase = sgate
+        ubase = sup
     var xt = x + tok * D_MODEL
     comptime ROW = Q4K_BYTES * (D_MODEL // 256) if GT == 0 else Q5K_BYTES * (D_MODEL // 256)
     var off = sl * expert_bytes + r * ROW
@@ -412,13 +422,13 @@ def gate_up_batch[GT: Int](
         comptime for blk in range(D_MODEL // 256):
             var xl = xt.load[width=4](blk * 256 + xbase)
             var xh = xt.load[width=4](blk * 256 + xbase + 32)
-            ga = q4k_block_gpu(gate + off + blk * Q4K_BYTES, lane, xl, xh, ga)
-            ua = q4k_block_gpu(up + off + blk * Q4K_BYTES, lane, xl, xh, ua)
+            ga = q4k_block_gpu(gbase + off + blk * Q4K_BYTES, lane, xl, xh, ga)
+            ua = q4k_block_gpu(ubase + off + blk * Q4K_BYTES, lane, xl, xh, ua)
         g = warp_tree(ga)
         u = warp_tree(ua)
     else:
-        g = warp_tree(row_dot_q5k[1, D_MODEL // 256](gate + off, xt, lane)[0])
-        u = warp_tree(row_dot_q5k[1, D_MODEL // 256](up + off, xt, lane)[0])
+        g = warp_tree(row_dot_q5k[1, D_MODEL // 256](gbase + off, xt, lane)[0])
+        u = warp_tree(row_dot_q5k[1, D_MODEL // 256](ubase + off, xt, lane)[0])
     if lane == 0:
         h[tok * TOPK * D_FF + e * D_FF + r] = silu_mul[1](g, u)[0]
 
@@ -427,6 +437,7 @@ def down_batch(
     down: Pointer[UInt8, ImmutAnyOrigin], down_q80: Int64,
     slots: Pointer[Int32, ImmutAnyOrigin], expert_bytes_: Int64,
     h: Pointer[Float32, ImmutAnyOrigin], s: Pointer[Float32, MutAnyOrigin],
+    sdown: Pointer[UInt8, ImmutAnyOrigin],
 ):
     """Block = (token, DROWS rows), TOPK warps (one per slot); s[t][e][i] for hot slots. Same math as down_slots."""
     var expert_bytes = Int(expert_bytes_)
@@ -439,6 +450,8 @@ def down_batch(
     if sl < 0:
         return
     var base = down + sl * expert_bytes
+    if sl >= STAGE_BASE:
+        base = sdown + (sl - STAGE_BASE) * expert_bytes
     var he = h + tok * TOPK * D_FF + e * D_FF
     var so = s + tok * TOPK * D_MODEL + e * D_MODEL
     if down_q80 == 1:
@@ -497,3 +510,18 @@ def combine_batch_kernel(s: Pointer[Float32, ImmutAnyOrigin], bres: Pointer[Floa
             v = bres.unsafe_load[volatile=True](tok * TOPK * D_MODEL + e * D_MODEL + i)[0]
         o = fma(w[tok * BW + e], v, o)
     y[tok * D_MODEL + i] = o
+
+
+
+def remap_stage_kernel(ids: Pointer[Int32, ImmutAnyOrigin], slots: Pointer[Int32, MutAnyOrigin], stage_of: Pointer[Int32, ImmutAnyOrigin],
+                       ntok: Int64):
+    """Cold picks whose expert was uploaded for this batch now point at its staging slot (STAGE_BASE + index)."""
+    var i = Int(block_idx.x * block_dim.x + thread_idx.x)
+    if i >= Int(ntok) * TOPK:
+        return
+    var t = i // TOPK
+    var e = i % TOPK
+    if slots[t * BW + e] < 0:
+        var st = stage_of[Int(ids[t * BW + e])]
+        if st >= 0:
+            slots[t * BW + e] = Int32(STAGE_BASE) + st
