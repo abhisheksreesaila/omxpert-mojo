@@ -4,12 +4,13 @@ from max.algorithm import parallelize
 from std.runtime import parallelism_level
 from std.atomic import Atomic
 from std.sys.intrinsics import prefetch
-from qexperts import row_dot_q4k, row_dot_q51, row_dot_q80, tree32, silu_mul, permute_x_q4k, arrange_h_q51
+from qexperts import row_dot_q5k, row_dot_q4k, row_dot_q51, row_dot_q80, tree32, silu_mul, permute_x_q4k, arrange_h_q51
 
 comptime D_MODEL = 2560
 comptime D_FF = 640
 comptime Q4K_ROW = 1440  # 10 blocks x 144
 comptime Q51_ROW = 480   # 20 blocks x 24
+comptime Q5K_ROW = 1760  # 10 blocks x 176
 comptime Q80_ROW = 680   # 20 blocks x 34
 comptime HV_PER_EXPERT = 3 * 8 * 32  # arranged h for Q5_1 down (3 iterations x 8 steps x 32 lanes)
 
@@ -18,7 +19,7 @@ def moe_cpu(
     gate: Pointer[UInt8, _], up: Pointer[UInt8, _], down: Pointer[UInt8, _], down_q80: Bool,
     expert_off_gu: Pointer[Int, _], expert_off_d: Pointer[Int, _], k: Int,
     w: Pointer[Float32, _], x: Pointer[Float32, _],
-    xp: Pointer[mut=True, Float32, _], h: Pointer[mut=True, Float32, _], hv: Pointer[mut=True, Float32, _], s: Pointer[mut=True, Float32, _], y: Pointer[mut=True, Float32, _], stages: Int = 3,
+    xp: Pointer[mut=True, Float32, _], h: Pointer[mut=True, Float32, _], hv: Pointer[mut=True, Float32, _], s: Pointer[mut=True, Float32, _], y: Pointer[mut=True, Float32, _], stages: Int = 3, gate_q5k: Bool = False,
 ):
     """out = sum_e w[e] * down_e(silu(gate_e x) * up_e x), experts in the given (sorted) order.
     expert_off_*: byte offset of each selected expert inside gate/up and down. s: per-expert down sums [k, D_MODEL]."""
@@ -32,12 +33,18 @@ def moe_cpu(
             var e = t // D_FF
             var r = t % D_FF
             var ahead = min(t + 4, na - 1)
-            var pa = expert_off_gu[ahead // D_FF] + (ahead % D_FF) * Q4K_ROW
+            var pa = expert_off_gu[ahead // D_FF] + (ahead % D_FF) * (Q5K_ROW if gate_q5k else Q4K_ROW)
             comptime for cl in range(0, Q4K_ROW, 64):
                 prefetch((gate + pa + cl).bitcast[Int8]())
                 prefetch((up + pa + cl).bitcast[Int8]())
-            var g = tree32(row_dot_q4k[32, D_MODEL // 256](gate + expert_off_gu[e] + r * Q4K_ROW, xp, 0))
-            var u = tree32(row_dot_q4k[32, D_MODEL // 256](up + expert_off_gu[e] + r * Q4K_ROW, xp, 0))
+            var g: Float32
+            var u: Float32
+            if gate_q5k:
+                g = tree32(row_dot_q5k[32, D_MODEL // 256](gate + expert_off_gu[e] + r * Q5K_ROW, xp, 0))
+                u = tree32(row_dot_q5k[32, D_MODEL // 256](up + expert_off_gu[e] + r * Q5K_ROW, xp, 0))
+            else:
+                g = tree32(row_dot_q4k[32, D_MODEL // 256](gate + expert_off_gu[e] + r * Q4K_ROW, xp, 0))
+                u = tree32(row_dot_q4k[32, D_MODEL // 256](up + expert_off_gu[e] + r * Q4K_ROW, xp, 0))
             h[t] = silu_mul[1](g, u)[0]
 
     if stages & 1:

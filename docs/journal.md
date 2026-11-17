@@ -48,3 +48,20 @@ Every step kept the per-lane arithmetic order, so CPU/GPU stayed bit-identical t
   expert per token: 470-580 us. The CPU request path costs ~0.4 ms for one 3 MB expert (memory alone ~0.19 ms):
   2 parallelize dispatches, serial permute/arrange, copies. Next: persistent CPU workers (pthreads) + split one cold
   expert's rows across all cores without per-request dispatch.
+
+## M4 (in progress): 48 layers, real routing, owner's profile
+- tools/build_model.py: pins from profile.bin under 35000 MiB split by free VRAM (21.0/18.3 GB), layers 0-23 GPU0,
+  24-47 GPU1 -> 11,704 experts (48%); held-out chat picks on the GPU 92.8% (night 6 llama.cpp: ~94% at 36500 MiB).
+  Real routing: 400 tokens sampled evenly from traces/.../chat_heldout.npz (93.3% hot). The first tokens of the
+  trace are atypically cold (54%), so don't take the head of the file.
+- Bugs on the way (all deadlocks of "GPU waits on CPU, CPU blocked on GPU"):
+  1. first launch of a kernel variant loads its module, which waits for the device to idle, while a combine kernel
+     spins on the CPU -> pre-launch every kernel variant with harmless args before the token loop;
+  2. a ctx.synchronize() at the warm-up/measure boundary while queued kernels wait on the CPU -> timestamp only.
+- 72.9 ms/token MoE -> 47.2 (warm) -> profile: empty parallelize(48) costs 236 us mean (60 best), 2 per cold request.
+- Persistent CPU co-processor (src/cpu_pool.mojo): 12 pthreads created from Mojo via the C FFI (abi("C") entry),
+  spinning; worker 0 polls the GPU mailbox rings itself; atomic barriers. Dispatch+sync 1.04 us (pthread_probe).
+  -> 35.7 ms/token.
+- Cold experts were being read from the SSD (50k major faults/s, 650 MB/s): loading 35 GB of hot experts through the
+  page cache evicted the cold ones. madvise(MADV_PAGEOUT) on each hot expert after its VRAM copy (= llama.cpp's
+  EDX_PAGEOUT) -> no major faults in the loop -> 11.7 ms/token MoE (CPU 8.5 ms for ~20 cold experts/token).

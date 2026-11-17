@@ -178,6 +178,77 @@ def row_dot_q4k[W: Int, NBLK: Int](row: Pointer[UInt8, _], xp: Pointer[Float32, 
     return acc
 
 
+# ---------------------------------------------------------------- Q5_K row dot (gate / up of layer 2)
+# block: d f16 | dmin f16 | scales[12] | qh[32] | qs[128] = 176 bytes / 256 values. Same lane mapping as Q4_K; the
+# 5th bit of value (chunk j, position i) is bit 2j (low nibble) or 2j+1 (high nibble) of qh[i]. Lane l's positions
+# 4(l%8)+k sit in qh word l%8.
+
+comptime Q5K_BYTES = 176
+
+
+@inline(.always)
+def row_dot_q5k[W: Int, NBLK: Int](row: Pointer[UInt8, _], xp: Pointer[Float32, _], lane0: Int) -> SIMD[F32, W]:
+    var acc = SIMD[F32, W](0)
+    comptime for blk in range(NBLK):
+        var b = row + blk * Q5K_BYTES
+        var hv = b.bitcast[UInt32]().load[width=4]()
+        var d = bitcast[DType.float16, 1](UInt16(hv[0] & 0xFFFF)).cast[F32]()
+        var dmin = bitcast[DType.float16, 1](UInt16(hv[0] >> 16)).cast[F32]()
+        var d1 = SIMD[F32, W](0)
+        var m1 = SIMD[F32, W](0)
+        var d2 = SIMD[F32, W](0)
+        var m2 = SIMD[F32, W](0)
+        var q = (b + 48).bitcast[UInt32]().load[width=W](lane0)
+        var qhw = SIMD[DType.uint32, W](0)
+        var sh = SIMD[DType.uint32, W](0)
+        comptime if W == 1:
+            var mine = scale_min_k4(hv[1], hv[2], hv[3], lane0 % 8)
+            var my_d = d * Float32(mine[0])
+            var my_m = dmin * Float32(mine[1])
+            var j = lane0 // 8
+            d1[0] = shuffle_idx(my_d, UInt32(2 * j))
+            m1[0] = shuffle_idx(my_m, UInt32(2 * j))
+            d2[0] = shuffle_idx(my_d, UInt32(2 * j + 1))
+            m2[0] = shuffle_idx(my_m, UInt32(2 * j + 1))
+            qhw[0] = (b + 16).bitcast[UInt32]()[lane0 % 8]
+            sh[0] = UInt32(2 * j)
+        else:
+            var dd = SIMD[F32, 32](0)
+            var mm = SIMD[F32, 32](0)
+            comptime for t in range(8):
+                var sm = scale_min_k4(hv[1], hv[2], hv[3], t)
+                dd[t] = d * Float32(sm[0])
+                mm[t] = dmin * Float32(sm[1])
+            d1 = rebind[SIMD[F32, W]](dd.shuffle[0,0,0,0,0,0,0,0,2,2,2,2,2,2,2,2,4,4,4,4,4,4,4,4,6,6,6,6,6,6,6,6]())
+            m1 = rebind[SIMD[F32, W]](mm.shuffle[0,0,0,0,0,0,0,0,2,2,2,2,2,2,2,2,4,4,4,4,4,4,4,4,6,6,6,6,6,6,6,6]())
+            d2 = rebind[SIMD[F32, W]](dd.shuffle[1,1,1,1,1,1,1,1,3,3,3,3,3,3,3,3,5,5,5,5,5,5,5,5,7,7,7,7,7,7,7,7]())
+            m2 = rebind[SIMD[F32, W]](mm.shuffle[1,1,1,1,1,1,1,1,3,3,3,3,3,3,3,3,5,5,5,5,5,5,5,5,7,7,7,7,7,7,7,7]())
+            var q8 = SIMD[DType.uint32, 32](0)
+            q8 = q8.insert[offset=0]((b + 16).bitcast[UInt32]().load[width=8]())
+            qhw = rebind[SIMD[DType.uint32, W]](q8.shuffle[0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7]())
+            comptime for i in range(W):
+                sh[i] = UInt32(2 * (i // 8))
+        comptime if W == 1:
+            var base = blk * 256 + 64 * (lane0 // 8) + 4 * (lane0 % 8)
+            var xl = xp.load[width=4](base)
+            var xh = xp.load[width=4](base + 32)
+            comptime for k in range(4):
+                var ql = u2f[W](((q >> UInt32(8 * k)) & 0xF) | (((qhw >> (sh + UInt32(8 * k))) & 1) << 4))
+                acc = fma(fma(d1, ql, -m1), SIMD[F32, W](xl[k]), acc)
+            comptime for k in range(4):
+                var qh = u2f[W](((q >> UInt32(8 * k + 4)) & 0xF) | (((qhw >> (sh + UInt32(8 * k + 1))) & 1) << 4))
+                acc = fma(fma(d2, qh, -m2), SIMD[F32, W](xh[k]), acc)
+        else:
+            var xb = xp + blk * 256 + lane0
+            comptime for k in range(4):
+                var ql = u2f[W](((q >> UInt32(8 * k)) & 0xF) | (((qhw >> (sh + UInt32(8 * k))) & 1) << 4))
+                acc = fma(fma(d1, ql, -m1), xb.load[width=W](k * 32), acc)
+            comptime for k in range(4):
+                var qh = u2f[W](((q >> UInt32(8 * k + 4)) & 0xF) | (((qhw >> (sh + UInt32(8 * k + 1))) & 1) << 4))
+                acc = fma(fma(d2, qh, -m2), xb.load[width=W]((k + 4) * 32), acc)
+    return acc
+
+
 def permute_x_q4k(x: Pointer[Float32, _], xp: Pointer[mut=True, Float32, _], n: Int):
     """xp[blk*256 + k*32 + l] = x[blk*256 + 64*(l/8) + 4*(l%8) + (k%4) + 32*(k/4)]. A pure permutation."""
     for blk in range(n // 256):

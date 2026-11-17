@@ -1,0 +1,2 @@
+loaded 36.6948352 GB of hot experts in 22.578999571 s
+{"tokens":  100 , "moe_ms_per_token":  47.23564476 , "cold_per_token":  27.04 , "cpu_ms_per_token":  44.15991811 , "hot_gb":  36.6948352 , "load_s":  22.578999571 }
