@@ -23,8 +23,8 @@ def moe_cpu(
     def stage_a(t: Int) {imm}:
         var e = t // D_FF
         var r = t % D_FF
-        var g = tree32(row_dot_q4k[32](gate + expert_off_gu[e] + r * Q4K_ROW, D_MODEL // 256, xp, 0))
-        var u = tree32(row_dot_q4k[32](up + expert_off_gu[e] + r * Q4K_ROW, D_MODEL // 256, xp, 0))
+        var g = tree32(row_dot_q4k[32, D_MODEL // 256](gate + expert_off_gu[e] + r * Q4K_ROW, xp, 0))
+        var u = tree32(row_dot_q4k[32, D_MODEL // 256](up + expert_off_gu[e] + r * Q4K_ROW, xp, 0))
         h[t] = silu_mul[1](g, u)[0]
 
     parallelize(stage_a, k * D_FF)
@@ -33,9 +33,9 @@ def moe_cpu(
         for e in range(k):
             var v: Float32
             if down_q80:
-                v = tree32(row_dot_q80[32](down + expert_off_d[e] + i * Q80_ROW, D_FF // 32, h + e * D_FF, 0))
+                v = tree32(row_dot_q80[32, D_FF // 32](down + expert_off_d[e] + i * Q80_ROW, h + e * D_FF, 0))
             else:
-                v = tree32(row_dot_q51[32](down + expert_off_d[e] + i * Q51_ROW, D_FF // 32, h + e * D_FF, 0))
+                v = tree32(row_dot_q51[32, D_FF // 32](down + expert_off_d[e] + i * Q51_ROW, h + e * D_FF, 0))
             s[e * D_MODEL + i] = v
         var o: Float32 = 0
         for e in range(k):

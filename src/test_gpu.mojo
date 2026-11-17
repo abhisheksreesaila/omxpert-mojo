@@ -6,7 +6,7 @@ from std.time import perf_counter_ns
 from std.random import random_ui64, seed
 from std.math import ceildiv
 from max.gpu.host import DeviceContext, DeviceBuffer
-from gpu_moe import permute_x_kernel, gate_up_kernel, down_kernel, D_MODEL, D_FF, TPB, WARPS_PER_BLOCK
+from gpu_moe import permute_x_kernel, gate_up_kernel, gate_up_kernel_reg, gate_up_kernel_split, GU_ROWS, down_kernel, down_kernel_par, ROWS_PER_BLOCK, D_MODEL, D_FF, TPB, WARPS_PER_BLOCK
 
 comptime K = 10
 comptime N_EXPERTS = 512
@@ -37,7 +37,7 @@ def main() raises:
     var a = argv()
     var eb_gu = Int(a[8])
     var eb_d = Int(a[9])
-    var q80 = a[7] == "1"
+    var q80 = Int(a[7])
     with DeviceContext() as ctx:
         var gate = load_tensor(ctx, String(a[1]), Int(a[2]), N_EXPERTS * eb_gu)
         var up = load_tensor(ctx, String(a[3]), Int(a[4]), N_EXPERTS * eb_gu)
@@ -80,14 +80,28 @@ def main() raises:
         ctx.enqueue_copy(dst_buf=ids, src_buf=hids)
         ctx.enqueue_copy(dst_buf=w, src_buf=hw)
 
+        var only = String(a[12]) if len(a) > 12 else String("all")
+
         @parameter
         def run(route: Int) raises:
             var ip = ids.unsafe_ptr() + K * route
-            ctx.enqueue_function[permute_x_kernel](x, xp, grid_dim=ceildiv(D_MODEL, TPB), block_dim=TPB)
-            ctx.enqueue_function[gate_up_kernel](gate, up, ip, eb_gu, K, xp, h,
+            if only == "perm":
+                ctx.enqueue_function[permute_x_kernel](x, xp, grid_dim=ceildiv(D_MODEL, TPB), block_dim=TPB)
+            if only == "gu1":
+              ctx.enqueue_function[gate_up_kernel](gate, up, ip, Int64(eb_gu), Int64(K), x, h,
                 grid_dim=ceildiv(K * D_FF, WARPS_PER_BLOCK), block_dim=TPB)
-            ctx.enqueue_function[down_kernel](down, q80, ip, w, eb_d, K, h, y,
+            if only == "gu3":
+              ctx.enqueue_function[gate_up_kernel_split](gate, up, ip, Int64(eb_gu), Int64(K), x, h,
+                grid_dim=ceildiv(K * D_FF * 2, WARPS_PER_BLOCK), block_dim=TPB)
+            if only == "all" or only == "gu":
+              ctx.enqueue_function[gate_up_kernel_reg](gate, up, ip, Int64(eb_gu), Int64(K), x, h,
+                grid_dim=ceildiv(K * D_FF // GU_ROWS, WARPS_PER_BLOCK), block_dim=TPB)
+            if only == "down1":
+              ctx.enqueue_function[down_kernel](down, Int64(q80), ip, w, Int64(eb_d), Int64(K), h, y,
                 grid_dim=ceildiv(D_MODEL, WARPS_PER_BLOCK), block_dim=TPB)
+            if only == "all" or only == "down":
+              ctx.enqueue_function[down_kernel_par](down, Int64(q80), ip, w, Int64(eb_d), Int64(K), h, y,
+                grid_dim=D_MODEL // ROWS_PER_BLOCK, block_dim=K * 32)
 
         run(0)
         ctx.enqueue_copy(dst_buf=hy, src_buf=y)

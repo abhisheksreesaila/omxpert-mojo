@@ -12,8 +12,16 @@
 
 from std.math import fma, floor
 from std.memory import bitcast
+from max.gpu.primitives.warp import shuffle_idx
 
 comptime F32 = DType.float32
+comptime MAGIC = UInt32(0x4B000000)  # bit pattern of 2^23: (MAGIC | q) as float - 2^23 == float(q) exactly, for q < 2^23
+
+
+@inline(.always)
+def u2f[W: Int](q: SIMD[DType.uint32, W]) -> SIMD[F32, W]:
+    """Exact small-integer -> float without the quarter-rate I2F instruction: one OR and one FADD."""
+    return bitcast[F32, W](q | MAGIC) - 8388608.0
 
 # ---------------------------------------------------------------- small helpers
 
@@ -90,41 +98,80 @@ comptime Q4K_BYTES = 144
 
 
 @inline(.always)
-def scale_min_k4(s: Pointer[UInt8, _], j: Int) -> Tuple[UInt8, UInt8]:
-    if j < 4:
-        return (s[j] & 63, s[j + 4] & 63)
-    return ((s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4), (s[j + 4] >> 4) | ((s[j] >> 6) << 4))
+def byte_of(s0: UInt32, s1: UInt32, s2: UInt32, j: Int) -> UInt32:
+    """Byte j (0..11) of the 12 scale bytes held in three little-endian words."""
+    var w = s0 if j < 4 else (s1 if j < 8 else s2)
+    return (w >> UInt32(8 * (j % 4))) & 0xFF
 
 
 @inline(.always)
-def row_dot_q4k[W: Int](row: Pointer[UInt8, _], nblk: Int, xp: Pointer[Float32, _], lane0: Int) -> SIMD[F32, W]:
+def scale_min_k4(s0: UInt32, s1: UInt32, s2: UInt32, j: Int) -> Tuple[UInt32, UInt32]:
+    if j < 4:
+        return (byte_of(s0, s1, s2, j) & 63, byte_of(s0, s1, s2, j + 4) & 63)
+    return (
+        (byte_of(s0, s1, s2, j + 4) & 0xF) | ((byte_of(s0, s1, s2, j - 4) >> 6) << 4),
+        (byte_of(s0, s1, s2, j + 4) >> 4) | ((byte_of(s0, s1, s2, j) >> 6) << 4),
+    )
+
+
+@inline(.always)
+def row_dot_q4k[W: Int, NBLK: Int](row: Pointer[UInt8, _], xp: Pointer[Float32, _], lane0: Int) -> SIMD[F32, W]:
+    """xp: x itself when W == 1 (GPU), the lane-permuted copy when W == 32 (CPU); the values each lane sees are equal.
+    Fully unrolled over NBLK blocks: every block's loads can be in flight at once. Arithmetic order per lane is
+    fixed (block, then low nibbles k = 0..3, then high nibbles), identical on CPU and GPU."""
     var acc = SIMD[F32, W](0)
-    for blk in range(nblk):
+    comptime for blk in range(NBLK):
         var b = row + blk * Q4K_BYTES
-        var d = f16_at(b, 0)
-        var dmin = f16_at(b, 2)
-        var sc = b + 4
-        # per-lane scale / min for its low (2j) and high (2j+1) sub-block
+        var hv = b.bitcast[UInt32]().load[width=4]()  # d|dmin, scales[0:12] in one 16-byte load
+        var h0 = hv[0]
+        var s0 = hv[1]
+        var s1 = hv[2]
+        var s2 = hv[3]
+        var d = bitcast[DType.float16, 1](UInt16(h0 & 0xFFFF)).cast[F32]()
+        var dmin = bitcast[DType.float16, 1](UInt16(h0 >> 16)).cast[F32]()
         var d1 = SIMD[F32, W](0)
         var m1 = SIMD[F32, W](0)
         var d2 = SIMD[F32, W](0)
         var m2 = SIMD[F32, W](0)
-        comptime for i in range(W):
-            var j = (lane0 + i) // 8
-            var lo = scale_min_k4(sc, 2 * j)
-            var hi = scale_min_k4(sc, 2 * j + 1)
-            d1[i] = d * Float32(lo[0])
-            m1[i] = dmin * Float32(lo[1])
-            d2[i] = d * Float32(hi[0])
-            m2[i] = dmin * Float32(hi[1])
-        var q = u32_lanes[W](b + 16, lane0)
-        var xb = xp + blk * 256 + lane0
-        comptime for k in range(4):
-            var ql = ((q >> UInt32(8 * k)) & 0xF).cast[F32]()
-            acc = fma(fma(d1, ql, -m1), xb.load[width=W](k * 32), acc)
-        comptime for k in range(4):
-            var qh = ((q >> UInt32(8 * k + 4)) & 0xF).cast[F32]()
-            acc = fma(fma(d2, qh, -m2), xb.load[width=W]((k + 4) * 32), acc)
+        comptime if W == 1:
+            # GPU: lane t decodes sub-block t % 8 once; lanes fetch sub-blocks 2j, 2j+1 by shuffle (no divergence per lane)
+            var mine = scale_min_k4(s0, s1, s2, lane0 % 8)
+            var my_d = d * Float32(mine[0])
+            var my_m = dmin * Float32(mine[1])
+            var j = lane0 // 8
+            d1[0] = shuffle_idx(my_d, UInt32(2 * j))
+            m1[0] = shuffle_idx(my_m, UInt32(2 * j))
+            d2[0] = shuffle_idx(my_d, UInt32(2 * j + 1))
+            m2[0] = shuffle_idx(my_m, UInt32(2 * j + 1))
+        else:
+            comptime for i in range(W):
+                var j = (lane0 + i) // 8
+                var lo = scale_min_k4(s0, s1, s2, 2 * j)
+                var hi = scale_min_k4(s0, s1, s2, 2 * j + 1)
+                d1[i] = d * Float32(lo[0])
+                m1[i] = dmin * Float32(lo[1])
+                d2[i] = d * Float32(hi[0])
+                m2[i] = dmin * Float32(hi[1])
+        var q = (b + 16).bitcast[UInt32]().load[width=W](lane0)
+        comptime if W == 1:
+            # x natural layout: lane's 4 low-nibble values and 4 high-nibble values are contiguous -> 2 vector loads
+            var base = blk * 256 + 64 * (lane0 // 8) + 4 * (lane0 % 8)
+            var xl = xp.load[width=4](base)
+            var xh = xp.load[width=4](base + 32)
+            comptime for k in range(4):
+                var ql = u2f[W]((q >> UInt32(8 * k)) & 0xF)
+                acc = fma(fma(d1, ql, -m1), SIMD[F32, W](xl[k]), acc)
+            comptime for k in range(4):
+                var qh = u2f[W]((q >> UInt32(8 * k + 4)) & 0xF)
+                acc = fma(fma(d2, qh, -m2), SIMD[F32, W](xh[k]), acc)
+        else:
+            var xb = xp + blk * 256 + lane0
+            comptime for k in range(4):
+                var ql = u2f[W]((q >> UInt32(8 * k)) & 0xF)
+                acc = fma(fma(d1, ql, -m1), xb.load[width=W](k * 32), acc)
+            comptime for k in range(4):
+                var qh = u2f[W]((q >> UInt32(8 * k + 4)) & 0xF)
+                acc = fma(fma(d2, qh, -m2), xb.load[width=W]((k + 4) * 32), acc)
     return acc
 
 
@@ -146,29 +193,55 @@ comptime Q80_BYTES = 34
 
 
 @inline(.always)
-def row_dot_q51[W: Int](row: Pointer[UInt8, _], nblk: Int, h: Pointer[Float32, _], lane0: Int) -> SIMD[F32, W]:
+def spread4(b: UInt32) -> UInt32:
+    """Bits 0..3 of b -> bit 4 of bytes 0..3 (one multiply instead of four shift/mask pairs)."""
+    return ((b * 0x00204081) & 0x01010101) << 4
+
+
+@inline(.always)
+def q51_block(b: Pointer[UInt8, _], p: Int, hl: SIMD[F32, 4], hh: SIMD[F32, 4], acc: Float32) -> Float32:
+    """One lane's share (qs bytes 4p..4p+3 -> 8 values) of one Q5_1 block. THE arithmetic, used by CPU and GPU:
+    s = sum q_k h_k (low k = 0..3, then high), hs = sum h_k (same order), return fma(m, hs, fma(d, s, acc))."""
+    var hw = b.bitcast[UInt32]()
+    var h0 = hw[0]
+    var qh = hw[1]
+    var qs = hw[2 + p]
+    var d = bitcast[DType.float16, 1](UInt16(h0 & 0xFFFF)).cast[F32]()
+    var m = bitcast[DType.float16, 1](UInt16(h0 >> 16)).cast[F32]()
+    var lo = (qs & 0x0F0F0F0F) | spread4((qh >> UInt32(4 * p)) & 0xF)
+    var hi = ((qs >> 4) & 0x0F0F0F0F) | spread4((qh >> UInt32(16 + 4 * p)) & 0xF)
+    var sq: Float32 = 0
+    var sh: Float32 = 0
+    comptime for k in range(4):
+        sq = fma(u2f[1]((lo >> UInt32(8 * k)) & 0xFF)[0], hl[k], sq)
+        sh = sh + hl[k]
+    comptime for k in range(4):
+        sq = fma(u2f[1]((hi >> UInt32(8 * k)) & 0xFF)[0], hh[k], sq)
+        sh = sh + hh[k]
+    return fma(m, sh, fma(d, sq, acc))
+
+
+@inline(.always)
+def row_dot_q51[W: Int, NBLK: Int](row: Pointer[UInt8, _], h: Pointer[Float32, _], lane0: Int) -> SIMD[F32, W]:
+    """Lane l owns qs bytes 4p..4p+3 (p = l % 4) of block 8*it + l/4, it = 0, 1, 2 (in that order); lanes past the
+    last block add nothing. h read from memory (the CPU path; the GPU keeps h in registers, see gpu_moe.mojo)."""
     var acc = SIMD[F32, W](0)
-    var lanes = lane_iota[W](lane0)
-    for blk in range(nblk):
-        var b = row + blk * Q51_BYTES
-        var d = SIMD[F32, W](f16_at(b, 0))
-        var m = SIMD[F32, W](f16_at(b, 2))
-        var qh = UInt32(b[4]) | (UInt32(b[5]) << 8) | (UInt32(b[6]) << 16) | (UInt32(b[7]) << 24)
-        var nib = SIMD[DType.uint32, W](0)
+    comptime ITERS = (NBLK + 7) // 8
+    comptime for it in range(ITERS):
         comptime for i in range(W):
             var l = lane0 + i
-            var byte = UInt32(b[8 + (l % 16)])
-            nib[i] = (byte >> UInt32(4 * (l // 16))) & 0xF
-        var hb = ((SIMD[DType.uint32, W](qh) >> lanes.cast[DType.uint32]()) & 1) << 4
-        var v = fma(d, (nib | hb).cast[F32](), m)
-        acc = fma(v, (h + blk * 32 + lane0).load[width=W](), acc)
+            var blk = 8 * it + l // 4
+            if blk < NBLK:
+                var p = l % 4
+                acc[i] = q51_block(row + blk * Q51_BYTES, p, h.load[width=4](blk * 32 + 4 * p),
+                                   h.load[width=4](blk * 32 + 16 + 4 * p), acc[i])
     return acc
 
 
 @inline(.always)
-def row_dot_q80[W: Int](row: Pointer[UInt8, _], nblk: Int, h: Pointer[Float32, _], lane0: Int) -> SIMD[F32, W]:
+def row_dot_q80[W: Int, NBLK: Int](row: Pointer[UInt8, _], h: Pointer[Float32, _], lane0: Int) -> SIMD[F32, W]:
     var acc = SIMD[F32, W](0)
-    for blk in range(nblk):
+    comptime for blk in range(NBLK):
         var b = row + blk * Q80_BYTES
         var d = SIMD[F32, W](f16_at(b, 0))
         var q = SIMD[F32, W](0)
