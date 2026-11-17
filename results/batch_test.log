@@ -1,0 +1,7 @@
+omx: Mojo expert layer ready, 22.554088664 s to load hot experts
+bit-identical tokens: 425 / 425
+{"tokens":  1 , "one_at_a_time_ms":  37.560419 , "batched_ms":  39.228464 , "batched_tok_s":  25.491693990363732 }
+{"tokens":  3 , "one_at_a_time_ms":  105.181864 , "batched_ms":  101.623726 , "batched_tok_s":  29.520665282436113 }
+{"tokens":  512 , "one_at_a_time_ms":  19952.435712 , "batched_ms":  9063.118826 , "batched_tok_s":  56.49269416298393 }
+{"bit_identical":  425 , "total":  425 }
+exit 0

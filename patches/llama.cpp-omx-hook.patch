@@ -1,5 +1,5 @@
 diff --git i/src/llama-graph.cpp w/src/llama-graph.cpp
-index edf1ca7..b0780af 100644
+index edf1ca7..20a9b6c 100644
 --- i/src/llama-graph.cpp
 +++ w/src/llama-graph.cpp
 @@ -1749,6 +1749,15 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
@@ -18,7 +18,7 @@ index edf1ca7..b0780af 100644
      if (prec_policy) {
          prec_policy->apply(res);
      }
-@@ -2224,6 +2233,57 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2224,6 +2233,65 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
      );
  }
  
@@ -33,6 +33,7 @@ index edf1ca7..b0780af 100644
 +    int64_t h     = 0;
 +    bool    tried = false;
 +    int32_t (*moe)(int64_t, int32_t, const float *, float *) = nullptr;
++    int32_t (*moe_batch)(int64_t, int32_t, const float *, float *, int32_t) = nullptr;   // optional: batched path
 +};
 +omx_api & omx() { static omx_api a; return a; }
 +bool omx_ready() {
@@ -52,6 +53,9 @@ index edf1ca7..b0780af 100644
 +    }
 +    auto init = (int64_t (*)(const char *, const char *)) dlsym(a.lib, "omx_init");
 +    a.moe = (int32_t (*)(int64_t, int32_t, const float *, float *)) dlsym(a.lib, "omx_moe");
++    if (getenv("OMX_NOBATCH") == nullptr) {
++        a.moe_batch = (int32_t (*)(int64_t, int32_t, const float *, float *, int32_t)) dlsym(a.lib, "omx_moe_batch");
++    }
 +    if (init == nullptr || a.moe == nullptr) {
 +        LLAMA_LOG_ERROR("omx: omx_init/omx_moe not found in %s\n", path);
 +        return false;
@@ -67,6 +71,10 @@ index edf1ca7..b0780af 100644
 +    }
 +    const int32_t il = (int32_t) (intptr_t) userdata;
 +    const ggml_tensor * x = dst->src[0];
++    if (dst->ne[1] > 1 && omx().moe_batch != nullptr && x->nb[1] == (size_t) x->ne[0]*sizeof(float) && dst->nb[1] == (size_t) dst->ne[0]*sizeof(float)) {
++        omx().moe_batch(omx().h, il, (const float *) x->data, (float *) dst->data, (int32_t) dst->ne[1]);
++        return;
++    }
 +    for (int64_t t = 0; t < dst->ne[1]; ++t) {
 +        omx().moe(omx().h, il, (const float *) ((const char *) x->data + t*x->nb[1]), (float *) ((char *) dst->data + t*dst->nb[1]));
 +    }
@@ -76,7 +84,7 @@ index edf1ca7..b0780af 100644
  ggml_tensor * llm_graph_context::build_moe_ffn(
           ggml_tensor * cur,
           ggml_tensor * gate_inp,
-@@ -2253,6 +2313,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2253,6 +2321,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 float   post_exp_norm_eps) const {
      const int64_t n_embd   = cur->ne[0];
      const int64_t n_tokens = cur->ne[1];
@@ -86,7 +94,8 @@ index edf1ca7..b0780af 100644
 +        return ggml_scale(ctx0, cur, 0.0f);
 +    }
 +    // OMX_PREFILL=1: prompts go through the Mojo layer too (token by token), so llama.cpp never reads the expert weights
-+    if ((n_tokens == 1 || getenv("OMX_PREFILL") != nullptr) && gate_inp != nullptr && getenv("OMX_LIB") != nullptr && omx_ready()) {
++    // only the 48 main layers: the MTP draft head (layer 48, its own experts) stays on llama.cpp
++    if ((n_tokens == 1 || getenv("OMX_PREFILL") != nullptr) && il < 48 && gate_inp != nullptr && getenv("OMX_LIB") != nullptr && omx_ready()) {
 +        ggml_tensor * args[1] = { ggml_cont(ctx0, cur) };
 +        ggml_tensor * out = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_tokens, 1, 1, args, 1, omx_op, 1, (void *) (intptr_t) il);
 +        cb(out, "ffn_moe_out_omx", il);
@@ -95,7 +104,7 @@ index edf1ca7..b0780af 100644
      const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
  
      ggml_tensor * logits = nullptr;
-@@ -2339,6 +2411,38 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2339,6 +2420,38 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          cb(selection_probs, "ffn_moe_probs_masked", il);
      }
  
@@ -134,7 +143,7 @@ index edf1ca7..b0780af 100644
      // select experts
      ggml_tensor * selected_experts = selected_experts_in;
      if (selected_experts == nullptr) {
-@@ -2346,6 +2450,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2346,6 +2459,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          cb(selected_experts->src[0], "ffn_moe_argsort", il);
      }
      cb(selected_experts, "ffn_moe_topk", il);
@@ -148,7 +157,7 @@ index edf1ca7..b0780af 100644
  
      if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
          // TODO: Use scalar div instead when/if implemented
-@@ -2367,10 +2478,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2367,10 +2487,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          cb(weights, "ffn_moe_weights_softmax", il);
      }
  
@@ -192,7 +201,7 @@ index edf1ca7..b0780af 100644
          cb(weights_sum, "ffn_moe_weights_sum", il);
  
          if (arch == LLM_ARCH_DEEPSEEK41) {
-@@ -2392,12 +2536,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2392,12 +2545,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          cb(weights, "ffn_moe_weights_scaled", il);
      }
  
@@ -211,7 +220,7 @@ index edf1ca7..b0780af 100644
      cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
  
      if (weight_before_ffn) {
-@@ -2621,6 +2771,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2621,6 +2780,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
      cb(moe_out, "ffn_moe_out", il);
  
      return moe_out;
@@ -255,7 +264,7 @@ index edf1ca7..b0780af 100644
  }
  
  ggml_tensor * llm_graph_context::build_moe_cache_slots(
-@@ -2630,7 +2817,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
+@@ -2630,7 +2826,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
           ggml_tensor * down_exps,
           ggml_tensor * gate_up_exps,
                   int   il) const {

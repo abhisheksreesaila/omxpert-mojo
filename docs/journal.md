@@ -97,3 +97,14 @@ Every step kept the per-lane arithmetic order, so CPU/GPU stayed bit-identical t
   tokens; only the CPU cold part doesn't amortise. Rough model for k=4 at ~76% acceptance (~3.5 tokens/step):
   ~45 ms per step -> ~13 ms/token -> ~75 tok/s. And batching does fix prompts: at 512 tokens per batch every expert
   is read once and the CPU becomes compute-bound (~1 ms/token of cold work).
+
+## Overnight (autopilot): speculation + batched layer
+- MTP speculation (Qwen's draft head, 2 drafts) with the one-token Mojo path: 33.9 tok/s (< 42.8). Acceptance 64-76%,
+  2.3-2.5 tokens/step, but verify = 3 separate token passes, and the draft head's ~3 GB of VRAM cut pins to 87.8%.
+  Hook now skips layer >= 48 (the MTP head's own experts stay on llama.cpp).
+- Batched expert layer (src/qmulti.mojo, layer48 batch kernels, cpu_pool batch job, omx_moe_batch): GPU kernels take a
+  token index; the CPU groups a batch's cold picks by expert (counting sort) and reads each cold expert ONCE for all
+  its tokens (dequantise once, per-token fma chains unchanged). test_batch: 425/425 tokens bit-identical to the
+  one-token path across Q4_K/Q5_1, Q5_K/Q8_0, Q4_K/Q8_0 layers.
+- In llama.cpp (OMX_PREFILL + batch): prompts 112 -> 190 tok/s (llama.cpp 227), decode 43.4. Prompt chunks are now
+  bound by the CPU reading the chunk's cold experts; the GPU re-reads hot weights per token (~0.85 s per 512 tokens).

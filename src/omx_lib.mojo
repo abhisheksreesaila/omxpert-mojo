@@ -13,9 +13,9 @@ from std.runtime import initialize_runtime
 from max.algorithm import parallelize
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from hybrid import router_kernel, N_EXPERTS, TOPK, MB_WORDS, DROWS
-from layer48 import topk_slots_kernel, gate_up_slots, down_slots, combine_res_kernel
+from layer48 import topk_slots_kernel, gate_up_slots, down_slots, combine_res_kernel, router_batch_kernel, topk_batch_kernel, collect_cold_kernel, gate_up_batch, down_batch, wait_done_kernel, combine_batch_kernel, BW
 from gpu_moe import D_MODEL, D_FF, WARPS_PER_BLOCK, TPB
-from cpu_pool import PoolCtl, start_pool, join_pool, NW, RING, C_COLD, C_BUSY_NS
+from cpu_pool import PoolCtl, start_pool, join_pool, NW, RING, C_COLD, C_BUSY_NS, BMAXT, BMAXP
 
 comptime NL = 48
 comptime PU8 = Pointer[UInt8, MutAnyOrigin]
@@ -67,6 +67,10 @@ struct Engine:
     var pool: Pointer[PoolCtl, MutAnyOrigin]
     @__allow_legacy_any_origin_fields
     var tids: Pointer[UInt64, MutAnyOrigin]
+    @__allow_legacy_any_origin_fields
+    var b: Pointer[PF32, MutAnyOrigin]      # per GPU (10 each): X, logits, w, ids, slots, h, s, y, total | host: hx, hy
+    @__allow_legacy_any_origin_fields
+    var bh: Pointer[PF32, MutAnyOrigin]
     var step: Int
     var calls: Int
     var call_ns: Int
@@ -90,6 +94,8 @@ struct Engine:
         self.pool = alloc[PoolCtl](1).as_unsafe_any_origin()
         self.pool.unsafe_write(PoolCtl())
         self.tids = alloc[UInt64](NW).as_unsafe_any_origin()
+        self.b = alloc[PF32](2 * 10).as_unsafe_any_origin()
+        self.bh = alloc[PF32](2 * 2).as_unsafe_any_origin()
         self.step = 0
         self.calls = 0
         self.call_ns = 0
@@ -208,6 +214,25 @@ struct Engine:
             self.hosti.append(rg^)
         p[].ring0 = self.sl[1]
         p[].ring1 = self.sl[3]
+        # batch path buffers (prompt chunks, speculative verify): up to BMAXT tokens per call
+        for gi in range(2):
+            var ctx = self.ctx0 if gi == 0 else self.ctx1
+            var bsizes = [BMAXT * D_MODEL, BMAXT * N_EXPERTS, BMAXT * BW, BMAXT * BW, BMAXT * BW, BMAXT * TOPK * D_FF, BMAXT * TOPK * D_MODEL, BMAXT * D_MODEL, 16]
+            for j in range(9):
+                var bb = ctx.enqueue_create_buffer[DType.float32](bsizes[j])
+                self.b[gi * 10 + j] = bb.unsafe_ptr().as_unsafe_any_origin()
+                self.bufsf.append(bb^)
+            for j in range(2):
+                var hb = ctx.enqueue_create_host_buffer[DType.float32](BMAXT * D_MODEL)
+                self.bh[gi * 2 + j] = hb.unsafe_ptr().as_unsafe_any_origin()
+                self.hostf.append(hb^)
+        var ba = self.ctx0.enqueue_create_host_buffer[DType.int32](1 + 3 * BMAXP)
+        var br = self.ctx0.enqueue_create_host_buffer[DType.float32](BMAXP * D_MODEL)
+        self.ctx0.synchronize()
+        p[].barea = ba.unsafe_ptr().as_unsafe_any_origin()
+        p[].bres = br.unsafe_ptr().as_unsafe_any_origin()
+        self.hosti.append(ba^)
+        self.hostf.append(br^)
         # load every kernel variant before anything can spin (module loads wait for an idle device)
         for gi in range(2):
             var ctx = self.ctx0 if gi == 0 else self.ctx1
@@ -232,6 +257,22 @@ struct Engine:
                 grid_dim=D_MODEL // DROWS, block_dim=TOPK * 32)
             ctx.enqueue_function[combine_res_kernel](self.g[G + 3], dmp, self.g[G + 1], dsp, self.g[G + 6], self.g[G + 5], Int32(-3),
                 grid_dim=ceildiv(D_MODEL, 256), block_dim=256)
+            var B = gi * 10
+            var bsl = self.b[B + 4].bitcast[Int32]()
+            ctx.enqueue_function[router_batch_kernel](self.rp[l0], self.b[B + 0], self.b[B + 1], grid_dim=N_EXPERTS // WARPS_PER_BLOCK, block_dim=TPB)
+            ctx.enqueue_function[topk_batch_kernel](self.b[B + 1], self.tp[l0], self.b[B + 2], self.b[B + 3].bitcast[Int32](), bsl, grid_dim=1, block_dim=N_EXPERTS)
+            var dba = ctx.enqueue_create_host_buffer[DType.int32](1 + 3 * TOPK)
+            ctx.synchronize()
+            ctx.enqueue_function[collect_cold_kernel](self.b[B + 3].bitcast[Int32](), dsp, Int64(1), dba.unsafe_ptr().as_unsafe_any_origin(), dmp, Int32(-3), self.b[B + 8].bitcast[Int32](), grid_dim=1, block_dim=32)
+            ctx.enqueue_function[gate_up_batch[0]](self.gp[l0], self.upp[l0], dsp, Int64(self.info[l0 * 5 + 1]), self.b[B + 0], self.b[B + 5],
+                grid_dim=ceildiv(TOPK * D_FF, WARPS_PER_BLOCK), block_dim=TPB)
+            ctx.enqueue_function[gate_up_batch[1]](self.gp[l0], self.upp[l0], dsp, Int64(self.info[l0 * 5 + 1]), self.b[B + 0], self.b[B + 5],
+                grid_dim=ceildiv(TOPK * D_FF, WARPS_PER_BLOCK), block_dim=TPB)
+            ctx.enqueue_function[down_batch](self.dp[l0], Int64(0), dsp, Int64(self.info[l0 * 5 + 2]), self.b[B + 5], self.b[B + 6],
+                grid_dim=D_MODEL // DROWS, block_dim=TOPK * 32)
+            ctx.enqueue_function[wait_done_kernel](dmp, self.b[B + 8].bitcast[Int32](), Int32(-3), grid_dim=1, block_dim=32)
+            ctx.enqueue_function[combine_batch_kernel](self.b[B + 6], p[].bres, self.b[B + 2], dsp, self.b[B + 7],
+                grid_dim=D_MODEL // 256, block_dim=256)
             ctx.synchronize()
         start_pool(self.pool, self.tids)
         print("omx: Mojo expert layer ready,", Float64(perf_counter_ns() - t_init) / 1e9, "s to load hot experts")
@@ -266,11 +307,58 @@ struct Engine:
         ctx.synchronize()
         unsafe_memcpy(dest=y, src=self.g[G + 8], count=D_MODEL)
         self.call_ns += perf_counter_ns() - t0
-        if self.calls % (NL * 64) == 0:
-            print("omx:", self.calls // NL, "tokens,", Float64(self.call_ns) / Float64(NL * 64) / 1e3, "us per layer call,",
-                  Float64(self.call_ns) / 64.0 / 1e6, "ms MoE per token, cold experts served",
-                  Atomic.load(self.pool[].ctl + C_COLD))
+        self.report()
+
+    def report(mut self):
+        if self.calls % (NL * 64) == 0 and self.calls > 0:
+            print("omx:", self.calls // NL, "layer-tokens/48,", Float64(self.call_ns) / Float64(NL * 64) / 1e3, "us per call avg,",
+                  "cold picks served", Atomic.load(self.pool[].ctl + C_COLD))
             self.call_ns = 0
+
+    def moe_batch(mut self, layer: Int, x: Pointer[Float32, MutAnyOrigin], y: Pointer[Float32, MutAnyOrigin], ntok: Int) raises:
+        """ntok tokens through one layer: each hot expert's rows run for all tokens that picked it, each cold expert is
+        read once by the CPU for all its tokens. Same bits as ntok calls of moe()."""
+        var done = 0
+        while done < ntok:
+            var T = min(BMAXT, ntok - done)
+            self.moe_chunk(layer, x + done * D_MODEL, y + done * D_MODEL, T)
+            done += T
+
+    def moe_chunk(mut self, layer: Int, x: Pointer[Float32, MutAnyOrigin], y: Pointer[Float32, MutAnyOrigin], T: Int) raises:
+        var t0 = perf_counter_ns()
+        var gi = self.info[layer * 5 + 0]
+        var ctx = self.ctx0 if gi == 0 else self.ctx1
+        var B = gi * 10
+        var seq = Int32(self.step + 1)
+        self.pool[].steplayer[self.step & 4095] = layer
+        self.pool[].bx = x
+        self.step += 1
+        self.calls += T
+        var mb = self.sl[gi * 2 + 1] + (Int(seq) % RING) * MB_WORDS
+        var slots = self.b[B + 4].bitcast[Int32]()
+        var total = self.b[B + 8].bitcast[Int32]()
+        unsafe_memcpy(dest=self.bh[gi * 2 + 0], src=x, count=T * D_MODEL)
+        ctx.enqueue_copy(self.b[B + 0], self.bh[gi * 2 + 0], T * D_MODEL)
+        ctx.enqueue_function[router_batch_kernel](self.rp[layer], self.b[B + 0], self.b[B + 1], grid_dim=T * (N_EXPERTS // WARPS_PER_BLOCK), block_dim=TPB)
+        ctx.enqueue_function[topk_batch_kernel](self.b[B + 1], self.tp[layer], self.b[B + 2], self.b[B + 3].bitcast[Int32](), slots,
+            grid_dim=T, block_dim=N_EXPERTS)
+        ctx.enqueue_function[collect_cold_kernel](self.b[B + 3].bitcast[Int32](), slots, Int64(T), self.pool[].barea, mb, seq, total,
+            grid_dim=1, block_dim=32)
+        if self.info[layer * 5 + 3] == 1:
+            ctx.enqueue_function[gate_up_batch[1]](self.gp[layer], self.upp[layer], slots, Int64(self.info[layer * 5 + 1]), self.b[B + 0], self.b[B + 5],
+                grid_dim=ceildiv(T * TOPK * D_FF, WARPS_PER_BLOCK), block_dim=TPB)
+        else:
+            ctx.enqueue_function[gate_up_batch[0]](self.gp[layer], self.upp[layer], slots, Int64(self.info[layer * 5 + 1]), self.b[B + 0], self.b[B + 5],
+                grid_dim=ceildiv(T * TOPK * D_FF, WARPS_PER_BLOCK), block_dim=TPB)
+        ctx.enqueue_function[down_batch](self.dp[layer], Int64(self.info[layer * 5 + 4]), slots, Int64(self.info[layer * 5 + 2]), self.b[B + 5], self.b[B + 6],
+            grid_dim=T * (D_MODEL // DROWS), block_dim=TOPK * 32)
+        ctx.enqueue_function[wait_done_kernel](mb, total, seq, grid_dim=1, block_dim=32)
+        ctx.enqueue_function[combine_batch_kernel](self.b[B + 6], self.pool[].bres, self.b[B + 2], slots, self.b[B + 7],
+            grid_dim=T * (D_MODEL // 256), block_dim=256)
+        ctx.enqueue_copy(self.bh[gi * 2 + 1], self.b[B + 7], T * D_MODEL)
+        ctx.synchronize()
+        unsafe_memcpy(dest=y, src=self.bh[gi * 2 + 1], count=T * D_MODEL)
+        self.call_ns += perf_counter_ns() - t0
 
 
 @export("omx_init")
@@ -306,3 +394,13 @@ def omx_stats(h: Int64, out3: Pointer[Float64, MutAnyOrigin]) abi("C"):
     out3[0] = Float64(e[].calls)
     out3[1] = Float64(Atomic.load(e[].pool[].ctl + C_COLD))
     out3[2] = Float64(Atomic.load(e[].pool[].ctl + C_BUSY_NS)) / 1e6
+
+
+@export("omx_moe_batch")
+def omx_moe_batch(h: Int64, layer: Int32, x: Pointer[Float32, MutAnyOrigin], y: Pointer[Float32, MutAnyOrigin], ntok: Int32) abi("C") -> Int32:
+    try:
+        _engine(h)[].moe_batch(Int(layer), x, y, Int(ntok))
+        return 0
+    except err:
+        print("omx_moe_batch failed:", err)
+        return -1
