@@ -1,0 +1,43 @@
+{
+ "layer": 10,
+ "n_experts": 512,
+ "top_k": 10,
+ "d_model": 2560,
+ "d_ff": 640,
+ "down": {
+  "file": "/home/abhisheksreesaila/models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf",
+  "offset": 18760128544,
+  "type": "Q5_1",
+  "shape": [
+   640,
+   2560,
+   512
+  ],
+  "expert_bytes": 1228800,
+  "row_bytes": 480
+ },
+ "gate": {
+  "file": "/home/abhisheksreesaila/models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf",
+  "offset": 19391014944,
+  "type": "Q4_K",
+  "shape": [
+   2560,
+   640,
+   512
+  ],
+  "expert_bytes": 921600,
+  "row_bytes": 1440
+ },
+ "up": {
+  "file": "/home/abhisheksreesaila/models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf",
+  "offset": 19869868064,
+  "type": "Q4_K",
+  "shape": [
+   2560,
+   640,
+   512
+  ],
+  "expert_bytes": 921600,
+  "row_bytes": 1440
+ }
+}
