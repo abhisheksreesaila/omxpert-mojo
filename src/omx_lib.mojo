@@ -75,6 +75,7 @@ struct Engine:
     var bh: Pointer[PF32, MutAnyOrigin]
     var bmaxt: Int
     var nstage: Int
+    var upload_min: Int
     @__allow_legacy_any_origin_fields
     var st: Pointer[PU8, MutAnyOrigin]     # per GPU: stage gate, up, down (device) | host pinned: gate, up, down (shared)
     @__allow_legacy_any_origin_fields
@@ -113,6 +114,8 @@ struct Engine:
         self.stmap = alloc[PI32](2 + 2).as_unsafe_any_origin()
         var ns = getenv("OMX_NSTAGE")
         self.nstage = Int(ns) if ns.byte_length() > 0 else 96
+        var um = getenv("OMX_UPLOAD_MIN")
+        self.upload_min = Int(um) if um.byte_length() > 0 else 1024   # short chunks: CPU-only cold path is faster
         self.bh = alloc[PF32](2 * 2).as_unsafe_any_origin()
         self.step = 0
         self.calls = 0
@@ -384,7 +387,7 @@ struct Engine:
         var total = self.b[B + 8].bitcast[Int32]()
         var geb = self.info[layer * 5 + 1]
         var deb = self.info[layer * 5 + 2]
-        var upload = T >= 64 and self.nstage > 0
+        var upload = T >= self.upload_min and self.nstage > 0
         unsafe_memcpy(dest=self.bh[gi * 2 + 0], src=x, count=T * D_MODEL)
         ctx.enqueue_copy(self.b[B + 0], self.bh[gi * 2 + 0], T * D_MODEL)
         ctx.enqueue_function[router_batch_kernel](self.rp[layer], self.b[B + 0], self.b[B + 1], grid_dim=T * (N_EXPERTS // WARPS_PER_BLOCK), block_dim=TPB)

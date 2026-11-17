@@ -120,3 +120,15 @@ Every step kept the per-lane arithmetic order, so CPU/GPU stayed bit-identical t
   pool at the same time. Still 425/425 bit-identical; uniformly routed 512-token chunk 9.1 -> 4.7 s.
 - Needle test fixed: raw /completion on a 26K-token doc ended at once (EOS) on every stack incl. stock; now uses
   /v1/chat/completions with thinking off.
+- Long context, fixed needle (26.5K tokens, chat API): code found by all three. Prompt speed: Mojo 2048-chunks + dual
+  path 214 tok/s, Mojo 512 116, llama.cpp 164 -> long prompts 1.3x faster than llama.cpp.
+- Attention vs context (llama-bench, experts dropped): 11.5 ms/token at 24K depth, same as 8K. The QSA sparse
+  attention in llama.cpp masks over all cells (no sparsity saving) but reading the KV is cheap at this size.
+  The "15 tok/s at 26K" in the needle test was an 8-token sample after a 26K prefill, not real.
+- Daily-driver candidates (2048 chunks, dual path), short chat / 25K-token prompt:
+  plain: 44.6 tok/s decode, 159 short prompts, 212 tok/s 25K prompt, 30.7 tok/s decode after it.
+  + MTP with the draft head's experts on the CPU (-otd exps=CPU): 35.7 short, 32.7 after 25K (79% accepted).
+  -> speculation stays off by default (D-21).
+- Short prompts were slower at 2048 chunks (159 vs 190): the upload path's sync + copies don't pay for a short chunk.
+  Upload now only for chunks >= OMX_UPLOAD_MIN (default 1024).
+- omxpert/run.sh: STACK=mojo starts the whole setup (Mojo layer, 2048 chunks, dual path, -lzm on, 40K context).
