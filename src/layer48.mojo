@@ -13,7 +13,7 @@ from max.gpu.intrinsics import threadfence, Scope
 from std.memory import unsafe_stack_allocation
 from qexperts import exp_det, Q51_BYTES, Q4K_BYTES, Q5K_BYTES, q51_block, row_dot_q80, row_dot_q5k
 from gpu_moe import warp_tree, q4k_block_gpu, silu_mul, D_MODEL, D_FF, Q80_ROW, Q51_ROW, WARPS_PER_BLOCK, TPB
-from hybrid import N_EXPERTS, TOPK, MB_SEQ, MB_DONE, MB_NCOLD, MB_ERR, MB_SLOT, MB_ID, MB_X, MB_S, MB_WORDS, DROWS
+from hybrid import N_EXPERTS, TOPK, MB_SEQ, MB_DONE, MB_NCOLD, MB_ERR, MB_SLOT, MB_ID, MB_X, MB_S, MB_WORDS, DROWS, MB_LAYER, MB_RING
 
 
 def topk_trace_kernel(
@@ -141,6 +141,24 @@ def combine_res_kernel(
     slots: Pointer[Int32, ImmutAnyOrigin], xin: Pointer[Float32, ImmutAnyOrigin], xout: Pointer[Float32, MutAnyOrigin],
     seq: Int32,
 ):
+    _combine(s, mb, w, slots, xin, xout, seq)
+
+
+def combine_dev_kernel(
+    s: Pointer[Float32, ImmutAnyOrigin], ring: Pointer[Int32, MutAnyOrigin], w: Pointer[Float32, ImmutAnyOrigin],
+    slots: Pointer[Int32, ImmutAnyOrigin], xin: Pointer[Float32, ImmutAnyOrigin], xout: Pointer[Float32, MutAnyOrigin],
+):
+    """In-stream variant: the sequence number is the one topk_dev_kernel stored in slots[TOPK + 1]."""
+    var seq = slots[TOPK + 1]
+    _combine(s, ring + (Int(seq) % MB_RING) * MB_WORDS, w, slots, xin, xout, seq)
+
+
+@inline(.always)
+def _combine(
+    s: Pointer[Float32, ImmutAnyOrigin], mb: Pointer[Int32, MutAnyOrigin], w: Pointer[Float32, ImmutAnyOrigin],
+    slots: Pointer[Int32, ImmutAnyOrigin], xin: Pointer[Float32, ImmutAnyOrigin], xout: Pointer[Float32, MutAnyOrigin],
+    seq: Int32,
+):
     """Waits for the CPU only if any expert is cold; y = sum_e fma(w_e, s_e) in slot order; next input = x + y."""
     var t = Int(thread_idx.x)
     var i = Int(block_idx.x) * Int(block_dim.x) + t
@@ -199,6 +217,43 @@ def wait_x_kernel(hb: Pointer[Int32, MutAnyOrigin], seq: Int32, x: Pointer[Float
 def topk_slots_kernel(
     logits: Pointer[Float32, ImmutAnyOrigin], res: Pointer[Int32, ImmutAnyOrigin], x: Pointer[Float32, ImmutAnyOrigin],
     w: Pointer[Float32, MutAnyOrigin], slots: Pointer[Int32, MutAnyOrigin], mb: Pointer[Int32, MutAnyOrigin], seq: Int32,
+):
+    _topk_post(logits, res, x, w, slots, mb, seq, Int32(0))
+
+
+def topk_dev_kernel(
+    logits: Pointer[Float32, ImmutAnyOrigin], res: Pointer[Int32, ImmutAnyOrigin], x: Pointer[Float32, ImmutAnyOrigin],
+    w: Pointer[Float32, MutAnyOrigin], slots: Pointer[Int32, MutAnyOrigin], ring: Pointer[Int32, MutAnyOrigin],
+    ctr: Pointer[Int32, MutAnyOrigin], layer: Int32,
+):
+    """In-stream variant (M8): no per-call host arguments, so a CUDA graph can replay it. The sequence number comes from
+    the shared pinned counter ctr[0] (one count across both GPUs, as the host path's), the mailbox slot from the
+    sequence number, and the layer goes into the mailbox. Waits until the CPU has answered the slot's last request."""
+    var sh = unsafe_stack_allocation[1, Int32, address_space=.SHARED]()
+    if thread_idx.x == 0:
+        var sq = ctr.unsafe_load[volatile=True](0)[0] + 1
+        ctr.unsafe_store[volatile=True](0, sq)
+        if sq > MB_RING:
+            # the slot is free once the last request posted to it (by either GPU's sequence) has been answered
+            var mbp = ring + (Int(sq) % MB_RING) * MB_WORDS
+            var spins = 0
+            while mbp.unsafe_load[volatile=True](MB_DONE)[0] != mbp.unsafe_load[volatile=True](MB_SEQ)[0]:
+                spins += 1
+                if spins > 400_000_000:
+                    mbp.unsafe_store[volatile=True](MB_ERR, Int32(-2))
+                    break
+        slots[TOPK + 1] = sq
+        sh[unsafe_offset=0] = sq
+    barrier()
+    var seq = sh[unsafe_offset=0][0]
+    _topk_post(logits, res, x, w, slots, ring + (Int(seq) % MB_RING) * MB_WORDS, seq, layer + 1)
+
+
+@inline(.always)
+def _topk_post(
+    logits: Pointer[Float32, ImmutAnyOrigin], res: Pointer[Int32, ImmutAnyOrigin], x: Pointer[Float32, ImmutAnyOrigin],
+    w: Pointer[Float32, MutAnyOrigin], slots: Pointer[Int32, MutAnyOrigin], mb: Pointer[Int32, MutAnyOrigin], seq: Int32,
+    layer1: Int32,
 ):
     """Real routing (M5): top-10 of the router logits by block argmax (ties -> lower id), sorted ids, weights =
     softmax over the 10 (llama.cpp: softmax, top-k, renormalise; this model has no extra weight scale).
@@ -271,6 +326,8 @@ def topk_slots_kernel(
     threadfence[Scope.SYSTEM]()
     barrier()
     if t == 0:
+        if layer1 > 0:
+            mb.unsafe_store[volatile=True](MB_LAYER, layer1)
         threadfence[Scope.SYSTEM]()
         mb.unsafe_store[volatile=True](MB_SEQ, seq)
 

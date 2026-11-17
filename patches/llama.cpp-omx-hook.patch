@@ -1,5 +1,66 @@
+diff --git i/ggml/src/ggml-cuda/ggml-cuda.cu w/ggml/src/ggml-cuda/ggml-cuda.cu
+index ee28955..1270e46 100644
+--- i/ggml/src/ggml-cuda/ggml-cuda.cu
++++ w/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2459,6 +2459,24 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+         nb1, nb2, nb3, stream);
+ }
+ 
++// omxpert-mojo: an external library may run chosen GGML_OP_CUSTOM nodes on the CUDA stream itself (no CPU split).
++// cpu_fun identifies the nodes (ggml_custom_op_params.fun); fn(stream, device, dst) enqueues the work on stream and
++// returns 0, or with stream == nullptr only answers whether it can run this node on this device (0 = yes).
++typedef int (*ggml_cuda_custom_stream_fn)(void * stream, int device, struct ggml_tensor * dst);
++static ggml_custom_op_t           g_omx_cpu_fun = nullptr;
++static ggml_cuda_custom_stream_fn g_omx_fn      = nullptr;
++static void ggml_backend_cuda_set_custom_stream_op(ggml_custom_op_t cpu_fun, ggml_cuda_custom_stream_fn fn) {
++    g_omx_cpu_fun = cpu_fun;
++    g_omx_fn      = fn;
++}
++static bool ggml_cuda_custom_on_stream(const ggml_tensor * op, int device) {
++    if (g_omx_fn == nullptr || op->op != GGML_OP_CUSTOM) {
++        return false;
++    }
++    const ggml_custom_op_params * p = (const ggml_custom_op_params *) op->op_params;
++    return p->fun == g_omx_cpu_fun && g_omx_fn(nullptr, device, (ggml_tensor *) op) == 0;
++}
++
+ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+     switch (dst->op) {
+         case GGML_OP_ARGMAX:
+@@ -2813,6 +2831,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_TOP_K_MASK:
+             ggml_cuda_op_top_k_mask(ctx, dst);
+             break;
++        case GGML_OP_CUSTOM:
++            if (g_omx_fn == nullptr || g_omx_fn((void *) ctx.stream(), ctx.device, dst) != 0) {
++                GGML_ABORT("custom op on CUDA: the stream hook refused node %s", dst->name);
++            }
++            break;
+         default:
+             return false;
+     }
+@@ -5860,6 +5883,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         }
+     }
+ 
++    if (op->op == GGML_OP_CUSTOM) {
++        return ggml_cuda_custom_on_stream(op, dev_ctx->device);
++    }
+     switch (op->op) {
+         case GGML_OP_UNARY:
+             switch (ggml_get_unary_op(op)) {
+@@ -6492,6 +6518,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+         return (void *)ggml_backend_cuda_comm_init_rank;
+     }
+ #endif // GGML_USE_NCCL
++    if (strcmp(name, "ggml_backend_cuda_set_custom_stream_op") == 0) {
++        return (void *)ggml_backend_cuda_set_custom_stream_op;
++    }
+     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
+         return (void *)ggml_backend_cuda_register_host_buffer;
+     }
 diff --git i/src/llama-graph.cpp w/src/llama-graph.cpp
-index edf1ca7..20a9b6c 100644
+index edf1ca7..36f7120 100644
 --- i/src/llama-graph.cpp
 +++ w/src/llama-graph.cpp
 @@ -1749,6 +1749,15 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
@@ -18,7 +79,7 @@ index edf1ca7..20a9b6c 100644
      if (prec_policy) {
          prec_policy->apply(res);
      }
-@@ -2224,6 +2233,65 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2224,6 +2233,101 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
      );
  }
  
@@ -34,8 +95,25 @@ index edf1ca7..20a9b6c 100644
 +    bool    tried = false;
 +    int32_t (*moe)(int64_t, int32_t, const float *, float *) = nullptr;
 +    int32_t (*moe_batch)(int64_t, int32_t, const float *, float *, int32_t) = nullptr;   // optional: batched path
++    int32_t (*moe_stream)(int64_t, int32_t, const float *, float *, void *) = nullptr;    // optional: on llama's CUDA stream
++    int32_t (*layer_gpu)(int64_t, int32_t) = nullptr;
 +};
 +omx_api & omx() { static omx_api a; return a; }
++void omx_op(ggml_tensor * dst, int ith, int nth, void * userdata);
++// OMX_STREAM=1: one-token nodes run on the CUDA backend: the Mojo kernels are enqueued on llama.cpp's own stream, so a
++// layer's experts never stop the GPU for the CPU (the cold experts still go to the CPU pool through the mailbox)
++struct omx_custom_params { ggml_custom_op_t fun; int n_tasks; void * userdata; };   // = ggml_custom_op_params (ggml-impl.h)
++int omx_stream_fn(void * stream, int device, ggml_tensor * dst) {
++    const int32_t il = (int32_t) (intptr_t) ((const omx_custom_params *) dst->op_params)->userdata;
++    const ggml_tensor * x = dst->src[0];
++    if (dst->ne[1] != 1 || x->type != GGML_TYPE_F32 || omx().layer_gpu(omx().h, il) != device) {
++        return 1;
++    }
++    if (stream == nullptr) {
++        return 0;
++    }
++    return omx().moe_stream(omx().h, il, (const float *) x->data, (float *) dst->data, stream);
++}
 +bool omx_ready() {
 +    omx_api & a = omx();
 +    if (a.tried) {
@@ -62,6 +140,19 @@ index edf1ca7..20a9b6c 100644
 +    }
 +    a.h = init(getenv("OMX_MODEL"), getenv("OMX_PINS"));
 +    LLAMA_LOG_INFO("omx: Mojo expert layer %s\n", a.h != 0 ? "ready" : "FAILED to start");
++    if (a.h != 0 && getenv("OMX_STREAM") != nullptr) {
++        a.moe_stream = (int32_t (*)(int64_t, int32_t, const float *, float *, void *)) dlsym(a.lib, "omx_moe_stream");
++        a.layer_gpu  = (int32_t (*)(int64_t, int32_t)) dlsym(a.lib, "omx_layer_gpu");
++        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
++        typedef int (*stream_fn_t)(void *, int, ggml_tensor *);
++        auto set = reg ? (void (*)(ggml_custom_op_t, stream_fn_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_custom_stream_op") : nullptr;
++        if (set != nullptr && a.moe_stream != nullptr && a.layer_gpu != nullptr) {
++            set(omx_op, omx_stream_fn);
++            LLAMA_LOG_INFO("omx: one-token layers run on llama.cpp's CUDA stream\n");
++        } else {
++            LLAMA_LOG_ERROR("omx: OMX_STREAM set but the CUDA stream hook or omx_moe_stream is missing\n");
++        }
++    }
 +    return a.h != 0;
 +}
 +void omx_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
@@ -71,6 +162,12 @@ index edf1ca7..20a9b6c 100644
 +    }
 +    const int32_t il = (int32_t) (intptr_t) userdata;
 +    const ggml_tensor * x = dst->src[0];
++    // OMX_NULLOP (timing only): keep the CPU stop per layer, skip the expert work, to measure what the stop costs
++    static const bool nullop = getenv("OMX_NULLOP") != nullptr;
++    if (nullop) {
++        memset(dst->data, 0, ggml_nbytes(dst));
++        return;
++    }
 +    if (dst->ne[1] > 1 && omx().moe_batch != nullptr && x->nb[1] == (size_t) x->ne[0]*sizeof(float) && dst->nb[1] == (size_t) dst->ne[0]*sizeof(float)) {
 +        omx().moe_batch(omx().h, il, (const float *) x->data, (float *) dst->data, (int32_t) dst->ne[1]);
 +        return;
@@ -84,7 +181,7 @@ index edf1ca7..20a9b6c 100644
  ggml_tensor * llm_graph_context::build_moe_ffn(
           ggml_tensor * cur,
           ggml_tensor * gate_inp,
-@@ -2253,6 +2321,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2253,6 +2357,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 float   post_exp_norm_eps) const {
      const int64_t n_embd   = cur->ne[0];
      const int64_t n_tokens = cur->ne[1];
@@ -104,7 +201,7 @@ index edf1ca7..20a9b6c 100644
      const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
  
      ggml_tensor * logits = nullptr;
-@@ -2339,6 +2420,38 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2339,6 +2456,38 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          cb(selection_probs, "ffn_moe_probs_masked", il);
      }
  
@@ -143,7 +240,7 @@ index edf1ca7..20a9b6c 100644
      // select experts
      ggml_tensor * selected_experts = selected_experts_in;
      if (selected_experts == nullptr) {
-@@ -2346,6 +2459,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2346,6 +2495,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          cb(selected_experts->src[0], "ffn_moe_argsort", il);
      }
      cb(selected_experts, "ffn_moe_topk", il);
@@ -157,7 +254,7 @@ index edf1ca7..20a9b6c 100644
  
      if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
          // TODO: Use scalar div instead when/if implemented
-@@ -2367,10 +2487,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2367,10 +2523,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          cb(weights, "ffn_moe_weights_softmax", il);
      }
  
@@ -201,7 +298,7 @@ index edf1ca7..20a9b6c 100644
          cb(weights_sum, "ffn_moe_weights_sum", il);
  
          if (arch == LLM_ARCH_DEEPSEEK41) {
-@@ -2392,12 +2545,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2392,12 +2581,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          cb(weights, "ffn_moe_weights_scaled", il);
      }
  
@@ -220,7 +317,7 @@ index edf1ca7..20a9b6c 100644
      cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
  
      if (weight_before_ffn) {
-@@ -2621,6 +2780,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -2621,6 +2816,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
      cb(moe_out, "ffn_moe_out", il);
  
      return moe_out;
@@ -264,7 +361,7 @@ index edf1ca7..20a9b6c 100644
  }
  
  ggml_tensor * llm_graph_context::build_moe_cache_slots(
-@@ -2630,7 +2826,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
+@@ -2630,7 +2862,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
           ggml_tensor * down_exps,
           ggml_tensor * gate_up_exps,
                   int   il) const {

@@ -11,11 +11,11 @@ from std.time import perf_counter_ns
 from qmulti import q4k_rows_multi, q51_rows_multi
 from qexperts import row_dot_q4k, row_dot_q5k, row_dot_q51, row_dot_q80, tree32, silu_mul, permute_x_q4k, arrange_h_q51
 from cpu_moe import D_MODEL, D_FF, Q4K_ROW, Q5K_ROW, Q51_ROW, Q80_ROW, HV_PER_EXPERT
-from hybrid import TOPK, MB_SEQ, MB_DONE, MB_NCOLD, MB_SLOT, MB_ID, MB_X, MB_S, MB_WORDS
+from hybrid import TOPK, MB_SEQ, MB_DONE, MB_NCOLD, MB_SLOT, MB_ID, MB_X, MB_S, MB_WORDS, MB_LAYER, MB_RING
 
 comptime NW = 12
 comptime NLMAX = 64
-comptime RING = 16
+comptime RING = MB_RING
 comptime BMAXT_DEFAULT = 512    # tokens per batch call (OMX_BMAXT overrides, see omx_lib)
 
 # control words (Int64)
@@ -380,6 +380,10 @@ def worker_entry(arg: Pointer[PoolCtl, MutAnyOrigin]) abi("C") -> Pointer[PoolCt
                 if Atomic.load(ctl + C_STOP) != 0:
                     return arg
             var l = p[].steplayer[step & 4095]
+            var lw = Int(mb.unsafe_load[volatile=True](MB_LAYER)[0])
+            if lw > 0:     # posted from the in-stream path: the GPU wrote the layer (no host step record)
+                l = lw - 1
+                mb.unsafe_store[volatile=True](MB_LAYER, Int32(0))
             if l < 0:
                 l = step % p[].nl
             var k = Int(mb.unsafe_load[volatile=True](MB_NCOLD)[0])

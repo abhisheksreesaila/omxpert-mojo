@@ -1,0 +1,68 @@
+{
+ "name": "nomoe",
+ "base": "http://127.0.0.1:18095",
+ "model": "/home/abhisheksreesaila/models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+ "extra": {},
+ "npred": 128,
+ "t": "09:33:10",
+ "warm": [],
+ "runs": [
+  {
+   "prompt_tokens": 554,
+   "completion_tokens": 128,
+   "ttft_s": 0.323,
+   "prefill_tok_s": 1717.2,
+   "decode_tok_s": 92.48,
+   "round": 0,
+   "prompt": 0
+  },
+  {
+   "prompt_tokens": 560,
+   "completion_tokens": 128,
+   "ttft_s": 0.251,
+   "prefill_tok_s": 2230.9,
+   "decode_tok_s": 93.37,
+   "round": 0,
+   "prompt": 1
+  },
+  {
+   "prompt_tokens": 546,
+   "completion_tokens": 128,
+   "ttft_s": 0.293,
+   "prefill_tok_s": 1865.4,
+   "decode_tok_s": 93.4,
+   "round": 0,
+   "prompt": 2
+  },
+  {
+   "prompt_tokens": 554,
+   "completion_tokens": 128,
+   "ttft_s": 0.246,
+   "prefill_tok_s": 2255.9,
+   "decode_tok_s": 93.44,
+   "round": 1,
+   "prompt": 0
+  },
+  {
+   "prompt_tokens": 560,
+   "completion_tokens": 128,
+   "ttft_s": 0.251,
+   "prefill_tok_s": 2232.4,
+   "decode_tok_s": 93.43,
+   "round": 1,
+   "prompt": 1
+  },
+  {
+   "prompt_tokens": 546,
+   "completion_tokens": 128,
+   "ttft_s": 0.251,
+   "prefill_tok_s": 2174.1,
+   "decode_tok_s": 93.2,
+   "round": 1,
+   "prompt": 2
+  }
+ ],
+ "decode_tok_s": 93.39,
+ "prefill_tok_s": 2202.5,
+ "prompts": "chat"
+}

@@ -11,9 +11,9 @@ from std.memory import alloc, unsafe_memcpy
 from std.atomic import Atomic
 from std.runtime import initialize_runtime
 from max.algorithm import parallelize
-from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer, DeviceStream
 from hybrid import router_kernel, N_EXPERTS, TOPK, MB_WORDS, DROWS, MB_NCOLD, MB_SEQ
-from layer48 import topk_slots_kernel, gate_up_slots, down_slots, combine_res_kernel, router_batch_kernel, topk_batch_kernel, collect_cold_kernel, gate_up_batch, down_batch, wait_done_kernel, combine_batch_kernel, BW, remap_stage_kernel
+from layer48 import topk_slots_kernel, gate_up_slots, down_slots, combine_res_kernel, topk_dev_kernel, combine_dev_kernel, router_batch_kernel, topk_batch_kernel, collect_cold_kernel, gate_up_batch, down_batch, wait_done_kernel, combine_batch_kernel, BW, remap_stage_kernel
 from gpu_moe import D_MODEL, D_FF, WARPS_PER_BLOCK, TPB
 from cpu_pool import PoolCtl, start_pool, join_pool, NW, RING, C_COLD, C_BUSY_NS, BMAXT_DEFAULT
 from std.os import getenv
@@ -83,8 +83,12 @@ struct Engine:
     @__allow_legacy_any_origin_fields
     var stmap: Pointer[PI32, MutAnyOrigin]  # per GPU: stage_of device [512] | host pinned stage_of [512], host pinned count
     var step: Int
+    @__allow_legacy_any_origin_fields
+    var ctr: Pointer[Int32, MutAnyOrigin]   # pinned: the last mailbox sequence number (host and in-stream paths share it)
     var calls: Int
     var call_ns: Int
+    var xs: List[DeviceStream]      # llama.cpp's CUDA streams, wrapped (in-stream path), one per GPU
+    var xs_raw: List[Int]
 
     def __init__(out self, model_txt: String, pins_bin: String) raises:
         self.ctx0 = DeviceContext(device_id=0)
@@ -118,8 +122,11 @@ struct Engine:
         self.upload_min = Int(um) if um.byte_length() > 0 else 1024   # short chunks: CPU-only cold path is faster
         self.bh = alloc[PF32](2 * 2).as_unsafe_any_origin()
         self.step = 0
+        self.ctr = alloc[Int32](16).as_unsafe_any_origin()   # replaced by the pinned word below
         self.calls = 0
         self.call_ns = 0
+        self.xs = List[DeviceStream]()
+        self.xs_raw = List[Int]()
         var t_init = perf_counter_ns()
 
         var mf = open(model_txt, "r")
@@ -224,7 +231,7 @@ struct Engine:
                 var hb = ctx.enqueue_create_host_buffer[DType.float32](D_MODEL)
                 self.g[gi * 9 + 7 + j] = hb.unsafe_ptr().as_unsafe_any_origin()
                 self.hostf.append(hb^)
-            var sb = ctx.enqueue_create_buffer[DType.int32](TOPK + 1)
+            var sb = ctx.enqueue_create_buffer[DType.int32](TOPK + 2)   # slots, ncold, seq (in-stream path)
             self.sl[gi * 2 + 0] = sb.unsafe_ptr().as_unsafe_any_origin()
             self.bufs32.append(sb^)
             var rg = ctx.enqueue_create_host_buffer[DType.int32](RING * MB_WORDS)
@@ -267,13 +274,15 @@ struct Engine:
             self.sth[j] = hb8.unsafe_ptr().as_unsafe_any_origin()
             self.hosti.append(self.ctx0.enqueue_create_host_buffer[DType.int32](1))   # keep list types simple
             self.host8.append(hb8^)
-        var hmap = self.ctx0.enqueue_create_host_buffer[DType.int32](N_EXPERTS + 16)
+        var hmap = self.ctx0.enqueue_create_host_buffer[DType.int32](N_EXPERTS + 32)
         self.stmap[2] = hmap.unsafe_ptr().as_unsafe_any_origin()
         self.stmap[3] = hmap.unsafe_ptr().as_unsafe_any_origin() + N_EXPERTS
+        self.ctr = hmap.unsafe_ptr().as_unsafe_any_origin() + N_EXPERTS + 16
         self.hosti.append(hmap^)
         var ba = self.ctx0.enqueue_create_host_buffer[DType.int32](1 + 3 * self.bmaxt * TOPK)
         var br = self.ctx0.enqueue_create_host_buffer[DType.float32](self.bmaxt * TOPK * D_MODEL)
         self.ctx0.synchronize()
+        self.ctr.unsafe_store[volatile=True](0, Int32(0))
         p[].barea = ba.unsafe_ptr().as_unsafe_any_origin()
         p[].bres = br.unsafe_ptr().as_unsafe_any_origin()
         self.hosti.append(ba^)
@@ -302,6 +311,12 @@ struct Engine:
                 grid_dim=D_MODEL // DROWS, block_dim=TOPK * 32)
             ctx.enqueue_function[combine_res_kernel](self.g[G + 3], dmp, self.g[G + 1], dsp, self.g[G + 6], self.g[G + 5], Int32(-3),
                 grid_dim=ceildiv(D_MODEL, 256), block_dim=256)
+            _ = ctx.compile_function[topk_dev_kernel]()
+            _ = ctx.compile_function[combine_dev_kernel]()
+            _ = ctx.compile_function[router_kernel]()
+            _ = ctx.compile_function[gate_up_slots[0]]()
+            _ = ctx.compile_function[gate_up_slots[1]]()
+            _ = ctx.compile_function[down_slots]()
             var B = gi * 10
             var bsl = self.b[B + 4].bitcast[Int32]()
             ctx.enqueue_function[router_batch_kernel](self.rp[l0], self.b[B + 0], self.b[B + 1], grid_dim=N_EXPERTS // WARPS_PER_BLOCK, block_dim=TPB)
@@ -328,9 +343,7 @@ struct Engine:
         var gi = self.info[layer * 5 + 0]
         var ctx = self.ctx0 if gi == 0 else self.ctx1
         var G = gi * 9
-        var seq = Int32(self.step + 1)
-        self.pool[].steplayer[self.step & 4095] = layer
-        self.step += 1
+        var seq = self.next_seq(layer)
         self.calls += 1
         unsafe_memcpy(dest=self.g[G + 7], src=x, count=D_MODEL)
         ctx.enqueue_copy(self.g[G + 4], self.g[G + 7], D_MODEL)
@@ -355,6 +368,47 @@ struct Engine:
         self.call_ns += perf_counter_ns() - t0
         self.report()
 
+    def moe_stream(mut self, layer: Int, x: PF32, y: PF32, stream: Int) raises:
+        """One token through one layer, enqueued on the caller's CUDA stream (llama.cpp's): x and y are device pointers on
+        this layer's GPU. Nothing here waits: routing, hot experts and the CPU hand-off all run in stream order, and every
+        kernel argument is fixed per layer, so a CUDA graph capture of this call can be replayed."""
+        var gi = self.info[layer * 5 + 0]
+        var ctx = self.ctx0 if gi == 0 else self.ctx1
+        var G = gi * 9
+        while len(self.xs_raw) < 2:
+            self.xs.append(ctx.stream())
+            self.xs_raw.append(0)
+        if self.xs_raw[gi] != stream:
+            self.xs[gi] = ctx.create_external_stream(Pointer[NoneType, MutAnyOrigin](unsafe_from_address=stream))
+            self.xs_raw[gi] = stream
+        var s = self.xs[gi]
+        var slots = self.sl[gi * 2 + 0]
+        var ring = self.sl[gi * 2 + 1]
+        s.enqueue_function(ctx.compile_function[router_kernel](), self.rp[layer], x, self.g[G + 0],
+            grid_dim=N_EXPERTS // WARPS_PER_BLOCK, block_dim=TPB)
+        s.enqueue_function(ctx.compile_function[topk_dev_kernel](), self.g[G + 0], self.tp[layer], x, self.g[G + 1], slots, ring,
+            self.ctr, Int32(layer), grid_dim=1, block_dim=N_EXPERTS)
+        if self.info[layer * 5 + 3] == 1:
+            s.enqueue_function(ctx.compile_function[gate_up_slots[1]](), self.gp[layer], self.upp[layer], slots,
+                Int64(self.info[layer * 5 + 1]), x, self.g[G + 2], grid_dim=ceildiv(TOPK * D_FF, WARPS_PER_BLOCK), block_dim=TPB)
+        else:
+            s.enqueue_function(ctx.compile_function[gate_up_slots[0]](), self.gp[layer], self.upp[layer], slots,
+                Int64(self.info[layer * 5 + 1]), x, self.g[G + 2], grid_dim=ceildiv(TOPK * D_FF, WARPS_PER_BLOCK), block_dim=TPB)
+        s.enqueue_function(ctx.compile_function[down_slots](), self.dp[layer], Int64(self.info[layer * 5 + 4]), slots,
+            Int64(self.info[layer * 5 + 2]), self.g[G + 2], self.g[G + 3], grid_dim=D_MODEL // DROWS, block_dim=TOPK * 32)
+        s.enqueue_function(ctx.compile_function[combine_dev_kernel](), self.g[G + 3], ring, self.g[G + 1], slots,
+            self.g[G + 6], y, grid_dim=ceildiv(D_MODEL, 256), block_dim=256)
+        self.calls += 1
+
+    def next_seq(mut self, layer: Int) -> Int32:
+        """Host path: take the next mailbox sequence number (the GPU is idle here, so the counter is stable) and record
+        the layer for the CPU coordinator."""
+        var seq = self.ctr.unsafe_load[volatile=True](0)[0] + 1
+        self.ctr.unsafe_store[volatile=True](0, seq)
+        self.pool[].steplayer[Int(seq - 1) & 4095] = layer
+        self.step = Int(seq)
+        return seq
+
     def report(mut self):
         if self.calls % (NL * 64) == 0 and self.calls > 0:
             print("omx:", self.calls // NL, "layer-tokens/48,", Float64(self.call_ns) / Float64(NL * 64) / 1e3, "us per call avg,",
@@ -375,11 +429,9 @@ struct Engine:
         var gi = self.info[layer * 5 + 0]
         var ctx = self.ctx0 if gi == 0 else self.ctx1
         var B = gi * 10
-        var seq = Int32(self.step + 1)
+        var seq = self.next_seq(layer)
         var p = self.pool
-        p[].steplayer[self.step & 4095] = layer
         p[].bx = x
-        self.step += 1
         self.calls += T
         var mb = self.sl[gi * 2 + 1] + (Int(seq) % RING) * MB_WORDS
         var slots = self.b[B + 4].bitcast[Int32]()
@@ -503,6 +555,39 @@ def omx_moe(h: Int64, layer: Int32, x: Pointer[Float32, MutAnyOrigin], y: Pointe
     except err:
         print("omx_moe failed:", err)
         return -1
+
+
+@export("omx_moe_stream")
+def omx_moe_stream(h: Int64, layer: Int32, x: Pointer[Float32, MutAnyOrigin], y: Pointer[Float32, MutAnyOrigin], stream: Int64) abi("C") -> Int32:
+    try:
+        _engine(h)[].moe_stream(Int(layer), x, y, Int(stream))
+        return 0
+    except err:
+        print("omx_moe_stream failed:", err)
+        return -1
+
+
+@export("omx_debug")
+def omx_debug(h: Int64, dst: Pointer[Int32, MutAnyOrigin]) abi("C"):
+    """out[0] = shared counter, out[1] = host step; then per ring (2) per slot (16): SEQ, DONE, NCOLD, LAYER, ERR."""
+    var e = _engine(h)
+    dst[unsafe_offset=0] = e[].ctr.unsafe_load[volatile=True](0)[0]
+    dst[unsafe_offset=1] = Int32(e[].step)
+    for g in range(2):
+        var ring = e[].sl[g * 2 + 1]
+        for k in range(RING):
+            var mb = ring + k * MB_WORDS
+            var o = 2 + (g * RING + k) * 5
+            dst[unsafe_offset=o + 0] = mb.unsafe_load[volatile=True](0)[0]
+            dst[unsafe_offset=o + 1] = mb.unsafe_load[volatile=True](16)[0]
+            dst[unsafe_offset=o + 2] = mb.unsafe_load[volatile=True](32)[0]
+            dst[unsafe_offset=o + 3] = mb.unsafe_load[volatile=True](8)[0]
+            dst[unsafe_offset=o + 4] = mb.unsafe_load[volatile=True](48)[0]
+
+
+@export("omx_layer_gpu")
+def omx_layer_gpu(h: Int64, layer: Int32) abi("C") -> Int32:
+    return Int32(_engine(h)[].info[Int(layer) * 5 + 0])
 
 
 @export("omx_stats")

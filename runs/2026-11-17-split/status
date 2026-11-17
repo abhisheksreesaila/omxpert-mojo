@@ -1,0 +1,4 @@
+mojo done {"name": "mojo", "decode_tok_s": 42.32, "prefill_tok_s": 179.5, "warm": []}
+nullop done {"name": "nullop", "decode_tok_s": 83.67, "prefill_tok_s": 1005.1, "warm": []}
+nomoe done {"name": "nomoe", "decode_tok_s": 93.39, "prefill_tok_s": 2202.5, "warm": []}
+mojo2 done {"name": "mojo2", "decode_tok_s": 42.45, "prefill_tok_s": 197.6, "warm": []}

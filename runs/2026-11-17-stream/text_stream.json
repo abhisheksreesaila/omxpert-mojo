@@ -1,0 +1,14 @@
+[
+ {
+  "text": "def fibonacci(n):\n    \"\"\"\n    This function calculates the nth Fibonacci number using an iterative approach.\n    \n    Parameters:\n    n (int): The position in the Fibonacci sequence (0-indexed).\n    \n    Returns:\n    int: The nth Fibonacci number.\n    \"\"\"\n    if n < 0:\n        raise ValueError(\"Input must be a non-negative integer\")\n    if n == 0:\n        return 0\n   ",
+  "decode_tok_s": 4.696251170540604
+ },
+ {
+  "text": ":\n\n<think>\nThe user is asking about the three main causes of the French Revolution. This is a common history question, though historians debate the exact framing. The most commonly cited \"three main causes\" in educational contexts are:\n\n1. Social inequality / the Estates system (the rigid class structure where the First and Second Estates had privileges while the Third Estate bore the tax burden)\n2. Economic crisis / financial problems (national debt from wars like the American Revolution, reg",
+  "decode_tok_s": 8.359745729973877
+ },
+ {
+  "text": "      });\n    case \"schedule_task\":\n      return defined({\n        triggerChosen: input.trigger !== undefined,\n        // Rejected calls are recorded too, so input strings must match a literal.\n        trigger: oneOf(stringField(input, \"trigger\"), [\"interval\", \"daily\"]) ?? \"interval\",\n      });\n    case \"send_message\":\n      return defined({\n        targetChosen: input.target !== undefined,\n        // Re",
+  "decode_tok_s": 11.224699821988077
+ }
+]
