@@ -132,3 +132,8 @@ Every step kept the per-lane arithmetic order, so CPU/GPU stayed bit-identical t
 - Short prompts were slower at 2048 chunks (159 vs 190): the upload path's sync + copies don't pay for a short chunk.
   Upload now only for chunks >= OMX_UPLOAD_MIN (default 1024).
 - omxpert/run.sh: STACK=mojo starts the whole setup (Mojo layer, 2048 chunks, dual path, -lzm on, 40K context).
+- Final back-to-back (runs/2026-11-17-final, STACK=mojo / llama.cpp pinned / STACK=mojo): short decode 42.7 / 31.9 /
+  41.9 tok/s; short prompts 180 / 224 / 189; 25K prompt 194 / 163 / 171; decode after 25K 29.3 / 26.9 / 25.8.
+  The long-context decode advantage fades; suspect -lzm on (on-demand n-gram rows vs cold experts in RAM).
+- M7: GLM-5.3-Flash projection from its config (45 layers, 288 experts top-8 + 1 shared, expert FFN 2048) and our
+  measured tiers: 14.5 tok/s at UD-IQ3_XXS (120 GB), RAM- and SSD-bound on cold experts; blocked on disk (74 GB free).

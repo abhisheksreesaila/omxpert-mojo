@@ -1,0 +1,21 @@
+{
+ "quant": "UD-IQ3_XXS",
+ "file_gb": 120,
+ "disk_free_gb": 74,
+ "blocked": true,
+ "blocker": "120 GB file vs 74 GB free disk; running it needs a new drive or the owner's yes to delete the 111 GB Qwen3.8-Flash-Next",
+ "expert_mb": 9.41,
+ "routed_gb_total": 113.8,
+ "experts_resident_share": 0.323,
+ "assumed_hit_share": 0.811,
+ "cold_gb_per_token": 0.599,
+ "cold_from_ram_share": 0.86,
+ "ms": {
+  "gpu": 17.0,
+  "cpu_ram": 25.7,
+  "ssd": 28.0,
+  "glue": 15.0
+ },
+ "projected_tok_s": 14.5,
+ "reference": "0xSero glm-flash-lite: 19.5 tok/s on one 3090 with an 8-channel EPYC (~150 GB/s RAM) and 4 NVMe RAID0"
+}

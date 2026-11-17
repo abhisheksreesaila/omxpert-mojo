@@ -66,8 +66,8 @@ svg .soft{fill:var(--soft)}
 <div class="wrap">
   <header class="hero">
     <div class="eyebrow">omxpert · Qwen3.8-Flash-Next · 2× RTX 3090 · notes from 16 Nov 2026</div>
-    <h1>A 125B model on a desktop, <em>1.5× faster</em> — frame by frame</h1>
-    <p class="lede">What a token goes through inside a mixture-of-experts transformer, why llama.cpp spent most of its time on one part of it, and the ~2,000 lines of Mojo that replaced that part. <b>42.8 tok/s instead of 25.9–28.8</b>, with output that stays bit-identical wherever each expert runs.</p>
+    <h1>A 125B model on a desktop, <em>1.3–1.6× faster</em> — frame by frame</h1>
+    <p class="lede">What a token goes through inside a mixture-of-experts transformer, why llama.cpp spent most of its time on one part of it, and the ~2,000 lines of Mojo that replaced that part. <b>about 42 tok/s instead of 26–32</b>, with output that stays bit-identical wherever each expert runs.</p>
     <div class="cta">
       <a class="btn" href="token.html"><svg class="iso" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2l7 4v8l-7 4-7-4V6z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3 6l7 4 7-4M10 10v8" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>Diagram 1: one token through the model</a>
       <a class="btn" href="layer.html"><svg class="iso" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2l7 4v8l-7 4-7-4V6z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3 6l7 4 7-4M10 10v8" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>Diagram 2: one MoE layer on your hardware</a>
@@ -203,20 +203,21 @@ svg .soft{fill:var(--soft)}
 
       <section class="frame" id="f11">
         <div><div class="num">FRAME 11 · THE RESULT</div>
-          <h2>42.8 tokens per second</h2>
-          <p>Same model, same chat prompts, same machine, measured back to back. llama.cpp with its usual flags: 27.2 and 28.8 tok/s. llama.cpp with our flags: 25.9. llama.cpp with the Mojo expert layer: <b>42.8</b>, using <i>less</i> VRAM for hot experts (31.6 GiB vs 34.2).</p>
+          <h2>42 tokens per second, and full context</h2>
+          <p>Same model, same chat prompts, same machine, measured back to back. llama.cpp's pinned stack: 25.9–31.9 tok/s across runs. With the Mojo expert layer: <b>41.9–44.6</b>, using <i>less</i> VRAM for hot experts.</p>
+          <p>At full context it holds up: a 26,500-token document is read at <b>194–214 tok/s</b> (llama.cpp 163–164) and the hidden code in its middle is found.</p>
           <p>Greedy text was byte-identical with half the hot experts moved to the CPU. <span class="tag ok">placement-invariant</span></p>
         </div>
         <div class="fig">
           <svg viewBox="0 0 520 230" role="img" aria-label="Decode speed bars" id="tpsSvg"></svg>
-          <div class="cap">decode tok/s · median of 2 rounds × 3 held-out chat prompts</div>
+          <div class="cap">median of 2 rounds × 3 held-out chat prompts · final back-to-back run</div>
         </div>
       </section>
 
       <section class="frame" id="f12">
         <div><div class="num">FRAME 12 · WHAT DIDN'T WORK</div>
           <h2>Two honest limits</h2>
-          <p><b>Prompts got slower:</b> 112 tok/s vs llama.cpp's 227, because the Mojo layer still feeds prompt tokens one at a time. Batched kernels are the fix. <span class="tag bad">regression</span></p>
+          <p><b>Short prompts still trail:</b> batching took them from 112 to 180–190 tok/s, but llama.cpp does 224. Long prompts now beat it, because big chunks upload their busiest cold experts to the GPU while the CPU takes the rest. <span class="tag bad">short prompts</span></p>
           <p><b>A guess that failed:</b> we expected back-to-back tokens to reuse cold experts, so checking several drafted tokens at once would be cheap. Your trace says no: 5 tokens need 3.6× the cold experts of one. The hot set is personal; the cold picks are a scattered long tail. <span class="tag bad">milestone 6 falsified</span></p>
         </div>
         <div class="fig">
@@ -229,12 +230,13 @@ svg .soft{fill:var(--soft)}
         <div><div class="num">FRAME 13 · NEXT</div>
           <h2>Where this goes next</h2>
           <p><b>Batched prompts:</b> each expert read once per prompt chunk, to win back prompt speed.</p>
-          <p><b>Exact speculation:</b> Qwen's own draft head guesses a few tokens, the Mojo layer checks them in one pass. The rough model says 60–75 tok/s with identical output.</p>
+          <p><b>Speculation, tested:</b> Qwen's draft head is right 64–79% of the time, but checking 3 tokens costs 2.4× the expert work here, so it only helped after long prompts. Off by default.</p>
+          <p><b>Into llama.cpp's own GPU stream:</b> one CPU hand-off per layer still costs about 5 ms per token. Launching the Mojo kernels on llama.cpp's stream removes it and lets CUDA graphs back in.</p>
           <p><b>Engram-style models:</b> Tencent's Hy4 flash (224B, 64B of it lookup tables, 12B active) has the same shape: lookup tables on the slow tier, hot experts on the GPUs.</p>
         </div>
         <div class="fig">
           <svg viewBox="0 0 520 220" role="img" aria-label="Roadmap: today 42.8, batched prompts, speculation target 60 to 75 tok/s" id="nextSvg"></svg>
-          <div class="cap">decode tok/s · measured (solid) and targets (dashed)</div>
+          <div class="cap">decode tok/s · measured (solid) and estimates (dashed)</div>
         </div>
       </section>
     </main>
@@ -344,8 +346,8 @@ function draw(){
     r[1].forEach(seg=>{const w=seg[1]*scale;el("rect",{x,y,width:w,height:34,fill:seg[2],"fill-opacity":.85,stroke:ink,"stroke-width":1},s);if(w>60)el("text",{x:x+5,y:y+21,"font-size":10.5},s,seg[0]);x+=w;});});
   el("text",{x:40,y:222,"font-size":11,class:"soft"},s,"approximate · the point: the cold experts now fit");
   // F11 tps
-  s=document.getElementById("tpsSvg");clear(s);bars(s,[{label:"llama.cpp, our flags",v:25.9,fill:soft},{label:"llama.cpp, best",v:28.8,fill:soft},{label:"+ Mojo experts",v:42.8,fill:hot}],50,"tok/s",160,300);
-  el("text",{x:0,y:190,"font-size":12},s,"prompts: 227 → 112 tok/s (one token at a time, for now)");
+  s=document.getElementById("tpsSvg");clear(s);bars(s,[{label:"llama.cpp pinned",v:31.9,fill:soft},{label:"+ Mojo experts",v:42.7,fill:hot},{label:"25K prompt, Mojo",v:194,fill:cold}],220,"tok/s",160,280);
+  el("text",{x:0,y:190,"font-size":12},s,"bars 1–2: decode · bar 3: prompt reading at 25K tokens (llama.cpp 163)");
   // F12 union
   s=document.getElementById("unionSvg");clear(s);
   const U=[[1,44.2],[2,76.7],[3,106.2],[5,160.1],[8,233.4]];const ux=v=>50+v*55,uy=v=>190-v*0.7;
@@ -357,8 +359,8 @@ function draw(){
   el("text",{x:ux(5.2),y:uy(44.2*2)+18,"font-size":11,fill:ok},s,"what we hoped (≤ 2×)");el("text",{x:ux(5.6),y:uy(330)+6,"font-size":11,class:"soft"},s,"no reuse at all");
   el("text",{x:ux(2.4),y:uy(0)+32,"font-size":11,class:"soft"},s,"tokens per batch");
   // F13 next
-  s=document.getElementById("nextSvg");clear(s);bars(s,[{label:"today",v:42.8,fill:hot},{label:"+ batched prompts",v:42.8,fill:hot,dash:true},{label:"+ speculation",v:70,fill:ok,dash:true}],80,"tok/s",160,280);
-  el("text",{x:0,y:190,"font-size":11,class:"soft"},s,"speculation target 60–75 tok/s, from a rough cost model");
+  s=document.getElementById("nextSvg");clear(s);bars(s,[{label:"today",v:42.7,fill:hot},{label:"+ in-stream (est.)",v:55,fill:ok,dash:true},{label:"GLM-5.3 (proj.)",v:14.5,fill:vio,dash:true}],80,"tok/s",160,280);
+  el("text",{x:0,y:190,"font-size":11,class:"soft"},s,"dashed = estimates · GLM needs 120 GB of disk (74 GB free)");
 }
 draw();
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change",draw);
