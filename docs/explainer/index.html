@@ -49,6 +49,8 @@ nav.rail a:hover,nav.rail a:focus-visible,nav.rail a.on{border-color:var(--ink);
 .stat div{display:grid}
 .stat b{font:700 26px/1 var(--display);font-variant-numeric:tabular-nums}
 .stat span{font:400 12px var(--mono);color:var(--soft)}
+.finds{margin:0;padding-left:20px;max-width:78ch;display:grid;gap:6px}
+.finds li{color:var(--soft)}.finds b{color:var(--ink)}
 .tag{display:inline-block;font:500 11px var(--mono);padding:2px 7px;border-radius:999px;border:1px solid currentColor;vertical-align:middle}
 .tag.ok{color:var(--ok)}.tag.bad{color:var(--bad)}
 footer{margin-top:28px;color:var(--soft);font:400 13px var(--mono)}
@@ -66,6 +68,19 @@ svg .soft{fill:var(--soft)}
     <div class="eyebrow">omxpert · Qwen3.8-Flash-Next · 2× RTX 3090 · notes from 16–17 Nov 2026</div>
     <h1>A 125B model on a desktop, <em>1.5–1.7× faster</em> — frame by frame</h1>
     <p class="lede">What a token goes through inside a mixture-of-experts transformer, why llama.cpp spent most of its time on one part of it, and the ~2,700 lines of Mojo that replaced that part. <b>about 50 tok/s instead of 26–32</b>, with output that stays bit-identical wherever each expert runs.</p>
+    <div class="stat" aria-label="Findings">
+      <div><b>49–54</b><span>tok/s decode, short chat<br>(llama.cpp 32)</span></div>
+      <div><b>38</b><span>tok/s after a 25K prompt<br>(llama.cpp 27)</span></div>
+      <div><b>221–258</b><span>tok/s reading short prompts<br>(llama.cpp 224)</span></div>
+      <div><b>26.5K</b><span>token needle found<br>40K context</span></div>
+      <div><b>0 bits</b><span>differ, CPU vs GPU<br>and with or without graphs</span></div>
+    </div>
+    <ul class="finds">
+      <li><b>Your profile decides what lives on the GPU.</b> Half the experts serve 93% of your picks; a generic coding profile covered 44%.</li>
+      <li><b>The cost was coordination, not math.</b> llama.cpp spent 70% of each token on experts while the GPUs idled; a Mojo expert layer with a GPU↔CPU mailbox cut that from 24.7 to about 9 ms.</li>
+      <li><b>Never stop the GPU.</b> Running Mojo's kernels inside llama.cpp's own GPU queue, with CUDA graphs on, took decode from 42 to 48 tok/s; the VRAM it freed held 1,700 more hot experts (54 tok/s).</li>
+      <li><b>Speculation doesn't pay here yet.</b> Each extra token routes to new cold experts, so checking 3 drafted tokens costs 2.4× the work. It should start paying once ~96% of picks are hot.</li>
+    </ul>
     <div class="cta">
       <a class="btn" href="token.html"><svg class="iso" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2l7 4v8l-7 4-7-4V6z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3 6l7 4 7-4M10 10v8" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>Diagram 1: one token through the model</a>
       <a class="btn" href="layer.html"><svg class="iso" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2l7 4v8l-7 4-7-4V6z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3 6l7 4 7-4M10 10v8" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>Diagram 2: one MoE layer on your hardware</a>

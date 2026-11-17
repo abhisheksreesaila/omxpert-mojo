@@ -27,3 +27,4 @@
 - D-25 · mailbox sequence numbers from a shared pinned counter the GPU increments, for both the in-stream and the host paths · CUDA graph replays freeze kernel arguments; one counter keeps the CPU coordinator's strict order across paths and GPUs · yes
 - D-26 · new default pins _full (17.6 / 15.9 GiB) · in-stream left 4.5 / 3.7 GB idle per GPU; 92.4% of picks hot vs 88.1%; ~1.7 GB margin per GPU kept for the desktop and graph memory · yes: passed the long-context check on the rerun (38 vs 30 tok/s after 25K, needle found)
 - D-27 · CPU pool sleeps (50 us polls) after 20 ms idle · an idle server kept 12 cores spinning at full power (heat, draw); 2 ms was too eager and cost ~6% decode, 20 ms never triggers during an answer · yes
+- D-28 · push the repo to a private GitHub repo · owner asked to read it on GitHub (overrides GOAL.md's 'no pushing' rule for the unattended run); private because runs and profiles come from the owner's own data · yes
