@@ -1,0 +1,47 @@
+{
+ "name": "warm",
+ "base": "http://127.0.0.1:18097",
+ "model": "/home/abhisheksreesaila/models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+ "extra": {},
+ "npred": 64,
+ "t": "11:40:07",
+ "warm": [
+  27.36,
+  35.21,
+  39.13,
+  31.01,
+  40.9
+ ],
+ "runs": [
+  {
+   "prompt_tokens": 554,
+   "completion_tokens": 64,
+   "ttft_s": 4.83,
+   "prefill_tok_s": 114.7,
+   "decode_tok_s": 42.0,
+   "round": 0,
+   "prompt": 0
+  },
+  {
+   "prompt_tokens": 560,
+   "completion_tokens": 64,
+   "ttft_s": 4.075,
+   "prefill_tok_s": 137.4,
+   "decode_tok_s": 54.8,
+   "round": 0,
+   "prompt": 1
+  },
+  {
+   "prompt_tokens": 546,
+   "completion_tokens": 64,
+   "ttft_s": 4.637,
+   "prefill_tok_s": 117.7,
+   "decode_tok_s": 52.92,
+   "round": 0,
+   "prompt": 2
+  }
+ ],
+ "decode_tok_s": 52.92,
+ "prefill_tok_s": 117.7,
+ "prompts": "chat"
+}

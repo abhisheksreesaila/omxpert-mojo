@@ -1,0 +1,12 @@
+{
+ "name": "old",
+ "prompt_tokens": 25297,
+ "prompt_tok_s": 163.61239825093256,
+ "gen_tokens": 128,
+ "decode_tok_s": 25.872214484325003,
+ "wall_s": 159.8217978477478,
+ "draft": {
+  "draft_n": null,
+  "draft_n_accepted": null
+ }
+}

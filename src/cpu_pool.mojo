@@ -357,6 +357,23 @@ def do_batch_job(p: Pointer[PoolCtl, MutAnyOrigin], w: Int, mut round: Int64):
     pool_barrier(p[].ctl, round)
 
 
+@inline(.always)
+def idle_wait(spins: Int, mut t_idle: Int) -> Int:
+    """Spin while work is likely (within 20 ms of the last job), then sleep 50 us per poll so an idle server doesn't keep
+    12 cores at full power. 20 ms, not less: with 92% of picks hot, workers often see no cold expert for several layers
+    in a row during an answer, and a sleeping worker costs ~60-100 us on wake. Only the first layer after a pause pays."""
+    comptime IDLE = 1 << 40
+    if spins >= IDLE:
+        _ = external_call["usleep", Int32](UInt32(50))
+        return spins
+    var n = spins + 1
+    if n == 1:
+        t_idle = Int(perf_counter_ns())
+    elif n % 1024 == 0 and Int(perf_counter_ns()) - t_idle > 20_000_000:
+        return IDLE
+    return n
+
+
 def worker_entry(arg: Pointer[PoolCtl, MutAnyOrigin]) abi("C") -> Pointer[PoolCtl, MutAnyOrigin]:
     var p = arg
     var ctl = p[].ctl
@@ -370,6 +387,8 @@ def worker_entry(arg: Pointer[PoolCtl, MutAnyOrigin]) abi("C") -> Pointer[PoolCt
             var mb0 = p[].ring0 + (Int(seq) % RING) * MB_WORDS
             var mb1 = p[].ring1 + (Int(seq) % RING) * MB_WORDS
             var mb = mb0
+            var spins = 0
+            var t_idle = 0
             while True:
                 if mb0.unsafe_load[volatile=True](MB_SEQ)[0] == seq:
                     mb = mb0
@@ -379,6 +398,7 @@ def worker_entry(arg: Pointer[PoolCtl, MutAnyOrigin]) abi("C") -> Pointer[PoolCt
                     break
                 if Atomic.load(ctl + C_STOP) != 0:
                     return arg
+                spins = idle_wait(spins, t_idle)
             var l = p[].steplayer[step & 4095]
             var lw = Int(mb.unsafe_load[volatile=True](MB_LAYER)[0])
             if lw > 0:     # posted from the in-stream path: the GPU wrote the layer (no host step record)
@@ -416,16 +436,21 @@ def worker_entry(arg: Pointer[PoolCtl, MutAnyOrigin]) abi("C") -> Pointer[PoolCt
         Atomic.store(ctl + C_STOP, Int64(1))
         return arg
     var seen = Int64(0)
+    var spins = 0
+    var t_idle = 0
     while True:
         var g = Atomic.load(ctl + C_GEN)
         if g != seen:
             seen = g
+            spins = 0
             if p[].j_mode == 1:
                 do_batch_job(p, w, round)
             else:
                 do_job(p, w, round)
         elif Atomic.load(ctl + C_STOP) != 0:
             break
+        else:
+            spins = idle_wait(spins, t_idle)
     return arg
 
 

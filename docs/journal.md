@@ -165,3 +165,14 @@ Every step kept the per-lane arithmetic order, so CPU/GPU stayed bit-identical t
   Launcher default reverted to last night's validated config until the owner decides; heavy runs paused.
 - Idle cost noticed: the CPU pool's 12 threads spin even when the server is idle (full power, heat). A backoff
   (sleep after ~1 ms without work) would fix it; also lowers sustained draw during runs.
+- Owner chose: cap both GPUs at 300 W (sudo nvidia-smi -pl 300, resets on reboot) and rerun. Power logged every 0.5 s:
+  peak 280 W per GPU, mean ~195 W, so the cap never bit and the 370 W limit was never near. Cause of the 10:37 power-off
+  stays unknown (no log); no repeat in three ~40-min runs since.
+- CPU pool idle backoff: workers and coordinator sleep 50 us per poll after 20 ms without work. A 2 ms threshold cost
+  decode speed (50.8 vs 54.3): with 92% of picks hot, workers often see no cold expert for several layers in a row and
+  paid the wake-up. Bit-identity harness unchanged (4/4).
+- Final back-to-back (runs/2026-11-17-m8final, new / old / new, desktop busy, load ~6.7):
+  short chat decode 49.3 / 41.0 / 53.9 tok/s; short prompts 221 / 189 / 258; 25K prompt 181 / 177 / 187;
+  decode after 25K 37.8 / 29.7 / 38.1; 26.5K needle found (prompt 206 tok/s). VRAM peak 22.9 GB of 24.
+  The long-context decode gap from last night (Mojo fading to llama.cpp's level) is gone: +28% after 25K.
+- Launcher default is now OMX_STREAM=1 + _full pins. M8 proof passes.

@@ -1,0 +1,16 @@
+{
+ "name": "new",
+ "p8k": {
+  "prompt_tokens": 8462,
+  "prompt_tok_s": 194.25341379370028,
+  "decode_tok_s": 0.0
+ },
+ "needle": {
+  "prompt_tokens": 26512,
+  "prompt_tok_s": 196.85885091189857,
+  "decode_tok_s": 18.265136724695683,
+  "answer": "48217-KESTREL",
+  "found": true,
+  "wall_s": 135.63386178016663
+ }
+}

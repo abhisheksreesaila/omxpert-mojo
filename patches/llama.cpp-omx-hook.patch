@@ -60,7 +60,7 @@ index ee28955..1270e46 100644
          return (void *)ggml_backend_cuda_register_host_buffer;
      }
 diff --git i/src/llama-graph.cpp w/src/llama-graph.cpp
-index edf1ca7..36f7120 100644
+index edf1ca7..dd50e4a 100644
 --- i/src/llama-graph.cpp
 +++ w/src/llama-graph.cpp
 @@ -1749,6 +1749,15 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
@@ -140,7 +140,7 @@ index edf1ca7..36f7120 100644
 +    }
 +    a.h = init(getenv("OMX_MODEL"), getenv("OMX_PINS"));
 +    LLAMA_LOG_INFO("omx: Mojo expert layer %s\n", a.h != 0 ? "ready" : "FAILED to start");
-+    if (a.h != 0 && getenv("OMX_STREAM") != nullptr) {
++    if (a.h != 0 && getenv("OMX_STREAM") != nullptr && strcmp(getenv("OMX_STREAM"), "0") != 0) {
 +        a.moe_stream = (int32_t (*)(int64_t, int32_t, const float *, float *, void *)) dlsym(a.lib, "omx_moe_stream");
 +        a.layer_gpu  = (int32_t (*)(int64_t, int32_t)) dlsym(a.lib, "omx_layer_gpu");
 +        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");

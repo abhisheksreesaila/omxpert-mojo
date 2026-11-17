@@ -1,0 +1,13 @@
+new vram: 22829 MiB 22180 MiB 
+new short: {"name": "new", "decode_tok_s": 50.81, "prefill_tok_s": 222.7, "warm": []}
+{"name": "new", "prompt_tokens": 25297, "prompt_tok_s": 183.58797392451316, "gen_tokens": 128, "decode_tok_s": 20.93011106307989, "wall_s": 144.14317893981934, "draft": {"draft_n": null, "draft_n_accepted": null}}
+{"name": "new", "p8k": {"prompt_tokens": 8462, "prompt_tok_s": 194.25341379370028, "decode_tok_s": 0.0}, "needle": {"prompt_tokens": 26512, "prompt_tok_s": 196.85885091189857, "decode_tok_s": 18.265136724695683, "answer": "48217-KESTREL", "found": true, "wall_s": 135.63386178016663}}
+new peak vram: 22887 MiB 22528 MiB 
+old vram: 20009 MiB 20533 MiB 
+old short: {"name": "old", "decode_tok_s": 32.91, "prefill_tok_s": 158.2, "warm": []}
+{"name": "old", "prompt_tokens": 25297, "prompt_tok_s": 163.61239825093256, "gen_tokens": 128, "decode_tok_s": 25.872214484325003, "wall_s": 159.8217978477478, "draft": {"draft_n": null, "draft_n_accepted": null}}
+old peak vram: 20059 MiB 20766 MiB 
+new2 vram: 22829 MiB 22514 MiB 
+new2 short: {"name": "new2", "decode_tok_s": 50.91, "prefill_tok_s": 223.2, "warm": []}
+{"name": "new2", "prompt_tokens": 25297, "prompt_tok_s": 177.77983299082646, "gen_tokens": 128, "decode_tok_s": 28.92520761238582, "wall_s": 146.94818758964539, "draft": {"draft_n": null, "draft_n_accepted": null}}
+new2 peak vram: 22885 MiB 22472 MiB 
