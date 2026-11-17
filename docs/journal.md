@@ -87,3 +87,13 @@ Every step kept the per-lane arithmetic order, so CPU/GPU stayed bit-identical t
 - Placement invariance: greedy 96 tokens x 3 prompts, pins A, A again, and B (22% hot, 68% of picks: thousands of
   experts moved to the CPU): byte-identical text.
 - Ops lesson: T3 restarts kill setsid/nohup children; run long jobs with systemd-run --user (pass PATH/HOME).
+
+## M6: premise falsified (FAIL, by measurement, before building)
+- M6 assumed consecutive tokens share cold experts, so a k=4 verify batch would read them once (<= 2x one token).
+  On the held-out chat trace (26,915 consecutive tokens, M5 pins): distinct cold experts per batch of 1/2/3/5/8 tokens
+  = 44 / 77 / 106 / 160 / 233 -> 1.00 / 1.74 / 2.40 / 3.62 / 5.28x one token. The profile concentrates the HOT set;
+  cold picks are a diverse long tail. The CPU is bandwidth-bound, so verify cold time ~3.6x at k=4: the bar can't be met.
+- What still holds: speculation amortises llama.cpp's ~16 ms/token of non-MoE work and the GPU hot path over k+1
+  tokens; only the CPU cold part doesn't amortise. Rough model for k=4 at ~76% acceptance (~3.5 tokens/step):
+  ~45 ms per step -> ~13 ms/token -> ~75 tok/s. And batching does fix prompts: at 512 tokens per batch every expert
+  is read once and the CPU becomes compute-bound (~1 ms/token of cold work).
