@@ -87,6 +87,9 @@ struct Engine:
     var ctr: Pointer[Int32, MutAnyOrigin]   # pinned: the last mailbox sequence number (host and in-stream paths share it)
     var calls: Int
     var call_ns: Int
+    var r_t: Int
+    var r_cold: Int
+    var r_busy: Int
     var xs: List[DeviceStream]      # llama.cpp's CUDA streams, wrapped (in-stream path), one per GPU
     var xs_raw: List[Int]
 
@@ -126,6 +129,9 @@ struct Engine:
         self.calls = 0
         self.call_ns = 0
         self.xs = List[DeviceStream]()
+        self.r_t = 0
+        self.r_cold = 0
+        self.r_busy = 0
         self.xs_raw = List[Int]()
         var t_init = perf_counter_ns()
 
@@ -399,6 +405,23 @@ struct Engine:
         s.enqueue_function(ctx.compile_function[combine_dev_kernel](), self.g[G + 3], ring, self.g[G + 1], slots,
             self.g[G + 6], y, grid_dim=ceildiv(D_MODEL, 256), block_dim=256)
         self.calls += 1
+        self.stream_report()
+
+    def stream_report(mut self):
+        """Every 256 tokens: wall ms per token (host enqueue clock, so averaged it tracks the GPU), cold picks per
+        token, and CPU pool busy ms per token (time the GPU may wait on the CPU)."""
+        comptime N = NL * 256
+        if self.calls % N != 0:
+            return
+        var now = perf_counter_ns()
+        var cold = Int(Atomic.load(self.pool[].ctl + C_COLD))
+        var busy = Int(Atomic.load(self.pool[].ctl + C_BUSY_NS))
+        if self.r_t > 0:
+            print("omx stream:", Float64(now - self.r_t) / 256e6, "ms/token wall,", Float64(cold - self.r_cold) / 256.0,
+                  "cold picks/token,", Float64(busy - self.r_busy) / 256e6, "ms/token CPU busy", flush=True)
+        self.r_t = now
+        self.r_cold = cold
+        self.r_busy = busy
 
     def next_seq(mut self, layer: Int) -> Int32:
         """Host path: take the next mailbox sequence number (the GPU is idle here, so the counter is stable) and record

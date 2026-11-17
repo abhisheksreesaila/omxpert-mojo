@@ -137,3 +137,31 @@ Every step kept the per-lane arithmetic order, so CPU/GPU stayed bit-identical t
   The long-context decode advantage fades; suspect -lzm on (on-demand n-gram rows vs cold experts in RAM).
 - M7: GLM-5.3-Flash projection from its config (45 layers, 288 experts top-8 + 1 shared, expert FFN 2048) and our
   measured tiers: 14.5 tok/s at UD-IQ3_XXS (120 GB), RAM- and SSD-bound on cold experts; blocked on disk (74 GB free).
+
+## 17 Nov (day): in-stream decode (M8)
+- Split cost measured first (runs/2026-11-17-split, same flags): real Mojo 42.3 / 42.5 tok/s, a null expert op that
+  keeps the 48 CPU stops 83.7, no expert op at all 93.4. So ggml's CPU stops cost only 1.2 ms/token; the rest of the
+  4.3 ms gap to (non-MoE 10.7 + Mojo pipelined 8.6) was Mojo waiting for its own GPU after every layer.
+- Probe (tools/probe/xstream.c): Mojo's DeviceContext uses the CUDA primary context (same CUcontext as cudart), wraps an
+  outside stream (create_external_stream), and its launches are recorded by CUDA graph capture and replay correctly.
+- omx_moe_stream: the decode layer enqueued on llama.cpp's stream, x/y as llama's device tensors, no copies, no waits.
+  ggml-cuda gained a hook: GGML_OP_CUSTOM nodes whose fun matches a registered op run on the CUDA backend.
+- Graph-safe hand-off: kernel args are frozen in a CUDA graph, so the mailbox sequence number now comes from a shared
+  pinned counter (the GPU increments it), the layer is written into the mailbox, combine reads the sequence number from
+  device memory. Host paths take numbers from the same counter.
+- Bug found by the harness: the slot-free wait assumed a slot's previous user was on the same GPU; the two GPUs share
+  one sequence. Fixed: a slot is free when its last posted request is answered (DONE == SEQ).
+- Harness (tools/probe/stream_layer.c): 144/144 per layer, 24-layer chain, 24/24 unwaited, 72/72 graph replays
+  bit-identical to the host path.
+- End to end: 48.0 tok/s vs 42.65 host path (same session), greedy text byte-identical on 3 prompts. CUDA graphs are
+  doing real work: 43.7 tok/s with GGML_CUDA_DISABLE_GRAPHS=1.
+- Freed VRAM went to experts: 4.5 / 3.7 GB were free per GPU during a run. Pins _full (17.6 / 15.9 GiB): 11,475 hot
+  experts, 92.4% of held-out picks (was 88.1%), ~1.7 GB left per GPU. 54.3 tok/s decode, 238 tok/s short prompts
+  (llama.cpp: 224), greedy text still byte-identical.
+- 10:37: the machine powered off during the back-to-back final (first "new" run: in-stream + _full pins, ~6 min in,
+  warm-up/short-chat phase). Journal stops mid-line, no MCE/Xid/panic, machine off for 21 min until 10:58.
+  Looks like a power trip (2x 3090 at up to 370 W each + 12 CPU cores spinning) or a power cut, not a software fault.
+  A memory-pressure warning (page allocation failure in reclaim) was logged at 10:29 by the previous run's server.
+  Launcher default reverted to last night's validated config until the owner decides; heavy runs paused.
+- Idle cost noticed: the CPU pool's 12 threads spin even when the server is idle (full power, heat). A backoff
+  (sleep after ~1 ms without work) would fix it; also lowers sustained draw during runs.

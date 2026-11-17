@@ -22,6 +22,9 @@ tricks, below the compiler), and get speed improvements; then run a gigantic MoE
    per batch), the foundation for exact self-speculation.
 7. **GLM-5.3-Flash on this box.** A measured per-layer cost model (from 3-4) projects GLM-5.3-Flash speed here; running it
    for real needs ~120-200 GB of disk (74 GB free) and is gated on the owner's yes to free space.
+8. **In-stream decode** (added 17 Nov, owner: "proceed"). The decode layer runs on llama.cpp's own CUDA stream: no CPU
+   stop per layer, CUDA graphs stay on. Output bit-identical to the host path (per layer, chained, under graph replay);
+   back-to-back decode faster than the previous default; greedy text byte-identical.
 
 ## Done means
 `scripts/check` prints PASS for 1-6 and 7 has either a real run or a projection plus the exact disk blocker.

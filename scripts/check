@@ -2,8 +2,8 @@
 # Prints PASS/FAIL for each milestone in GOAL.md. Each milestone's proof is tests/mN.sh: it runs the real measurement
 # (or, for the heavy end-to-end ones, re-validates the result file it wrote) and exits 0 only if the GOAL.md bar is met.
 cd "$(dirname "$0")/.."
-names=("" "GPU expert kernel" "CPU same bits" "hybrid layer" "48 layers, real profile" "end to end" "batched verify" "GLM-5.3-Flash")
-for n in 1 2 3 4 5 6 7; do
+names=("" "GPU expert kernel" "CPU same bits" "hybrid layer" "48 layers, real profile" "end to end" "batched verify" "GLM-5.3-Flash" "in-stream decode")
+for n in 1 2 3 4 5 6 7 8; do
   t=tests/m$n.sh
   if [ ! -x "$t" ]; then echo "FAIL $n ${names[$n]} (no proof yet)"; continue; fi
   out=$(timeout 3600 "$t" 2>&1); rc=$?
