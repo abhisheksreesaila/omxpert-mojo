@@ -1,0 +1,266 @@
+diff --git i/src/llama-graph.cpp w/src/llama-graph.cpp
+index edf1ca7..b0780af 100644
+--- i/src/llama-graph.cpp
++++ w/src/llama-graph.cpp
+@@ -1749,6 +1749,15 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
+         ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur_mm, slots);
+ 
++    // EDX_PREFILL_LOCAL: in pinned mode a large batch runs each layer's experts on the GPU that holds the layer's pinned experts,
++    // so they are copied from that GPU's cache (same device) and only the cold experts come from host memory
++    static const bool edx_prefill_local = getenv("EDX_PREFILL_LOCAL") != nullptr;
++    if (edx_prefill_local && slots == nullptr && moe_cache != nullptr && moe_cache->pinned() && ids->ne[1] > 8) {
++        if (ggml_backend_t be = moe_cache->backend_of(w)) {
++            ggml_backend_sched_set_tensor_backend(sched, res, be);
++        }
++    }
++
+     if (prec_policy) {
+         prec_policy->apply(res);
+     }
+@@ -2224,6 +2233,57 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     );
+ }
+ 
++
++// ---- omxpert-mojo: when OMX_LIB is set, the routed MoE of one-token (decode) batches is computed by libomxmoe.so,
++// the Mojo expert layer (hot experts in VRAM pools from the owner's profile, cold experts on a CPU worker pool, CPU and
++// GPU bit-identical). Prompts keep llama.cpp's own path. OMX_MODEL / OMX_PINS: omxpert-mojo/results/model.txt, pins.bin
++#include <dlfcn.h>
++namespace {
++struct omx_api {
++    void *  lib   = nullptr;
++    int64_t h     = 0;
++    bool    tried = false;
++    int32_t (*moe)(int64_t, int32_t, const float *, float *) = nullptr;
++};
++omx_api & omx() { static omx_api a; return a; }
++bool omx_ready() {
++    omx_api & a = omx();
++    if (a.tried) {
++        return a.h != 0;
++    }
++    a.tried = true;
++    const char * path = getenv("OMX_LIB");
++    if (path == nullptr) {
++        return false;
++    }
++    a.lib = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
++    if (a.lib == nullptr) {
++        LLAMA_LOG_ERROR("omx: dlopen(%s) failed: %s\n", path, dlerror());
++        return false;
++    }
++    auto init = (int64_t (*)(const char *, const char *)) dlsym(a.lib, "omx_init");
++    a.moe = (int32_t (*)(int64_t, int32_t, const float *, float *)) dlsym(a.lib, "omx_moe");
++    if (init == nullptr || a.moe == nullptr) {
++        LLAMA_LOG_ERROR("omx: omx_init/omx_moe not found in %s\n", path);
++        return false;
++    }
++    a.h = init(getenv("OMX_MODEL"), getenv("OMX_PINS"));
++    LLAMA_LOG_INFO("omx: Mojo expert layer %s\n", a.h != 0 ? "ready" : "FAILED to start");
++    return a.h != 0;
++}
++void omx_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    (void) nth;
++    if (ith != 0) {
++        return;
++    }
++    const int32_t il = (int32_t) (intptr_t) userdata;
++    const ggml_tensor * x = dst->src[0];
++    for (int64_t t = 0; t < dst->ne[1]; ++t) {
++        omx().moe(omx().h, il, (const float *) ((const char *) x->data + t*x->nb[1]), (float *) ((char *) dst->data + t*dst->nb[1]));
++    }
++}
++} // namespace
++
+ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * cur,
+          ggml_tensor * gate_inp,
+@@ -2253,6 +2313,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                float   post_exp_norm_eps) const {
+     const int64_t n_embd   = cur->ne[0];
+     const int64_t n_tokens = cur->ne[1];
++    // EDX timing only: EDX_NOMOE drops the routed experts and their router from the graph, so the decode time with
++    // minus the time without is what the routed MoE costs this engine (omxpert-mojo M4). Output is meaningless.
++    if (getenv("EDX_NOMOE") != nullptr) {
++        return ggml_scale(ctx0, cur, 0.0f);
++    }
++    // OMX_PREFILL=1: prompts go through the Mojo layer too (token by token), so llama.cpp never reads the expert weights
++    if ((n_tokens == 1 || getenv("OMX_PREFILL") != nullptr) && gate_inp != nullptr && getenv("OMX_LIB") != nullptr && omx_ready()) {
++        ggml_tensor * args[1] = { ggml_cont(ctx0, cur) };
++        ggml_tensor * out = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_tokens, 1, 1, args, 1, omx_op, 1, (void *) (intptr_t) il);
++        cb(out, "ffn_moe_out_omx", il);
++        return out;
++    }
+     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+ 
+     ggml_tensor * logits = nullptr;
+@@ -2339,6 +2411,38 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(selection_probs, "ffn_moe_probs_masked", il);
+     }
+ 
++    // EDX draft: route only to pinned experts (slot >= 0), so the draft never runs an expert on the CPU
++    // EDX_STEER=<lambda>: soft nudge toward pinned experts (selection only; weights stay the model's own)
++    if (moe_cache != nullptr && moe_cache->pinned() && !moe_cache->draft() && selected_experts_in == nullptr && getenv("EDX_STEER") != nullptr) {
++        ggml_tensor * sm = moe_cache->get_slot_map(il, n_tokens, n_expert_used);
++        if (sm != nullptr) {
++            const float f = expf(-(float) atof(getenv("EDX_STEER")));
++            ggml_tensor * hot = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_cast(ctx0, sm, GGML_TYPE_F32), 1.0f, 0.5f)); // 1 pinned
++            if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
++                // selection runs on raw logits (gpt-oss): the same nudge in log space, logit - lambda for non-pinned experts
++                // (multiplying a negative logit by e^-lambda would raise it)
++                const float lam = -logf(f);
++                ggml_tensor * add = ggml_scale_bias(ctx0, ggml_reshape_2d(ctx0, hot, n_expert, 1), lam, -lam);            // 0 or -lambda
++                selection_probs = ggml_add(ctx0, selection_probs, add);
++            } else {
++                ggml_tensor * mul = ggml_scale_bias(ctx0, ggml_reshape_2d(ctx0, hot, n_expert, 1), 1.0f - f, f);      // 1 or e^-lambda
++                selection_probs = ggml_mul(ctx0, selection_probs, mul);
++            }
++            cb(selection_probs, "ffn_moe_probs_edx_steer", il);
++        }
++    }
++    if (moe_cache != nullptr && moe_cache->draft() && selected_experts_in == nullptr) {
++        ggml_tensor * sm = moe_cache->get_slot_map(il, n_tokens, n_expert_used);
++        if (sm != nullptr) {
++            ggml_tensor * mask = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_cast(ctx0, sm, GGML_TYPE_F32), 1.0f, 0.5f)); // 1 pinned
++            mask = ggml_scale_bias(ctx0, ggml_reshape_2d(ctx0, mask, n_expert, 1), 1e4f, -1e4f);                          // 0 or -1e4
++            selection_probs = ggml_add(ctx0, selection_probs, mask);
++            cb(selection_probs, "ffn_moe_probs_edx_draft", il);
++            static int n_log = 0;
++            if (n_log++ < 2) { LLAMA_LOG_INFO("EDX draft mask built (layer %d, n_tokens %lld)\n", il, (long long) n_tokens); }
++        }
++    }
++
+     // select experts
+     ggml_tensor * selected_experts = selected_experts_in;
+     if (selected_experts == nullptr) {
+@@ -2346,6 +2450,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(selected_experts->src[0], "ffn_moe_argsort", il);
+     }
+     cb(selected_experts, "ffn_moe_topk", il);
++    if (moe_cache != nullptr && moe_cache->pinned() && !moe_cache->draft() &&
++        ((n_tokens > 32 && getenv("EDX_PIN_PROMPT") != nullptr) || (n_tokens <= 8 && getenv("EDX_TRACE_DECODE") != nullptr))) {
++        ggml_tensor * ids_out = ggml_cont(ctx0, selected_experts); // selected_experts is a strided view of the argsort
++        ggml_set_output(ids_out); // read after compute to pick the lineup for the answer
++        ggml_build_forward_expand(gf, ids_out);
++        moe_cache->note_prefill_ids(il, ids_out);
++    }
+ 
+     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
+         // TODO: Use scalar div instead when/if implemented
+@@ -2367,10 +2478,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(weights, "ffn_moe_weights_softmax", il);
+     }
+ 
++    // EDX_SKIP=<16|8|s>: P6 "skip the miss" (Hugging Face MoE handbook). A token-layer with 1-2 selected experts outside the
++    // hot set drops them (never the top-2); the kept weights are divided by the router's top-16 mass (16), the selected
++    // top-k mass (8) or the survivors' mass (s). A dropped expert's id becomes the top-1 id with weight 0, so it is never read.
++    ggml_tensor * edx_drop = nullptr;
++    ggml_tensor * edx_ids  = nullptr;
++    if (norm_w && moe_cache != nullptr && moe_cache->pinned() && !moe_cache->draft() && selected_experts_in == nullptr && getenv("EDX_SKIP") != nullptr) {
++        ggml_tensor * sm = moe_cache->get_slot_map(il, n_tokens, n_expert_used);
++        if (sm != nullptr) {
++            ggml_tensor * hot = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_cast(ctx0, sm, GGML_TYPE_F32), 1.0f, 0.5f));       // [1, E]
++            hot = ggml_repeat(ctx0, ggml_reshape_3d(ctx0, hot, 1, n_expert, 1), probs);                                         // [1, E, T]
++            ggml_tensor * miss = ggml_scale_bias(ctx0, ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, hot, selected_experts), n_expert_used, n_tokens), -1.0f, 1.0f); // [K, T]
++            ggml_tensor * few  = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_sum_rows(ctx0, miss), -1.0f, 2.5f));              // [1, T]: at most 2 misses
++            ggml_tensor * rest = ggml_step(ctx0, ggml_scale_bias(ctx0, ggml_arange(ctx0, 0.0f, (float) n_expert_used, 1.0f), 1.0f, -1.5f)); // [K]: rank >= 2
++            edx_drop = ggml_mul(ctx0, ggml_mul(ctx0, miss, few), ggml_reshape_2d(ctx0, rest, n_expert_used, 1));               // [K, T]
++            ggml_tensor * sel_f = ggml_cast(ctx0, ggml_cont(ctx0, selected_experts), GGML_TYPE_F32);                           // [K, T]
++            ggml_tensor * top1  = ggml_view_2d(ctx0, sel_f, 1, n_tokens, sel_f->nb[1], 0);                                      // [1, T]
++            sel_f   = ggml_add(ctx0, ggml_sub(ctx0, sel_f, ggml_mul(ctx0, sel_f, edx_drop)), ggml_mul(ctx0, edx_drop, top1));
++            edx_ids = ggml_cast(ctx0, sel_f, GGML_TYPE_I32);
++            cb(edx_drop, "ffn_moe_edx_drop", il);
++        }
++    }
++
+     if (norm_w) {
+         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+ 
+         ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
++        if (edx_drop != nullptr) {
++            const char d = getenv("EDX_SKIP")[0];
++            weights = ggml_sub(ctx0, weights, ggml_mul(ctx0, weights, edx_drop));
++            if (d == 's') {
++                weights_sum = ggml_sum_rows(ctx0, weights);
++            } else if (d == '1') {
++                ggml_tensor * p2  = ggml_reshape_2d(ctx0, probs, n_expert, n_tokens);
++                ggml_tensor * i16 = ggml_argsort_top_k(ctx0, p2, std::min<int64_t>(16, n_expert));
++                weights_sum = ggml_sum_rows(ctx0, ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, probs, i16), std::min<int64_t>(16, n_expert), n_tokens));
++            }
++        }
+         cb(weights_sum, "ffn_moe_weights_sum", il);
+ 
+         if (arch == LLM_ARCH_DEEPSEEK41) {
+@@ -2392,12 +2536,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(weights, "ffn_moe_weights_scaled", il);
+     }
+ 
++    if (edx_ids != nullptr) {
++        selected_experts = edx_ids;
++    }
++
+     //call early so that topk-moe can be used
+     ggml_build_forward_expand(gf, weights);
+ 
+     // the experts of host-resident layers may be read from the MoE cache
+     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+ 
++    // the expert computation; EDX pinned mode runs it twice (hot experts from VRAM slots, cold ones on the CPU)
++    auto edx_tail = [&](ggml_tensor * cur, ggml_tensor * selected_experts, ggml_tensor * slots, ggml_tensor * weights) -> ggml_tensor * {
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+ 
+     if (weight_before_ffn) {
+@@ -2621,6 +2771,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     cb(moe_out, "ffn_moe_out", il);
+ 
+     return moe_out;
++    };
++
++    if (slots != nullptr && moe_cache->pinned() && !weight_before_ffn) {
++        const int64_t n_used = selected_experts->ne[0];
++        ggml_tensor * s_f   = ggml_cast(ctx0, slots, GGML_TYPE_F32);                       // [n_used, n_tokens], -1 = not pinned
++        ggml_tensor * hot   = ggml_step(ctx0, ggml_scale_bias(ctx0, s_f, 1.0f, 0.5f));     // 1 if pinned
++        ggml_tensor * ids_h = ggml_cast(ctx0, ggml_mul(ctx0, s_f, hot), GGML_TYPE_I32);    // cold rows -> slot 0, weight 0
++        ggml_tensor * sel_f = ggml_cast(ctx0, ggml_cont(ctx0, selected_experts), GGML_TYPE_F32);
++        // hot rows go to a cold expert this token already uses (no extra CPU read), else to a fixed cold expert
++        const int64_t n_tok = sel_f->ne[1];
++        ggml_tensor * cold1 = ggml_mul(ctx0, ggml_scale_bias(ctx0, sel_f, 1.0f, 1.0f), ggml_scale_bias(ctx0, hot, -1.0f, 1.0f)); // cold id + 1, hot 0
++        ggml_tensor * amax  = ggml_cast(ctx0, ggml_argmax(ctx0, cold1), GGML_TYPE_F32);                                           // [n_tok]
++        ggml_tensor * flat  = ggml_add(ctx0, amax, ggml_arange(ctx0, 0.0f, (float) (n_tok*n_used), (float) n_used));
++        ggml_tensor * pick  = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, ggml_cont(ctx0, cold1), 1, n_tok*n_used), ggml_cast(ctx0, flat, GGML_TYPE_I32)); // [1, n_tok]
++        pick = ggml_reshape_2d(ctx0, pick, 1, n_tok);
++        ggml_tensor * none  = ggml_step(ctx0, ggml_scale_bias(ctx0, pick, -1.0f, 0.5f));                                          // 1 if no cold expert
++        ggml_tensor * dumm  = ggml_add(ctx0, ggml_scale_bias(ctx0, pick, 1.0f, -1.0f), ggml_scale(ctx0, none, (float) moe_cache->pinned_dummy(il) + 1.0f));
++        ggml_tensor * ids_c = ggml_add(ctx0, ggml_sub(ctx0, sel_f, ggml_mul(ctx0, sel_f, hot)), ggml_mul(ctx0, hot, dumm)); // hot rows -> a cold expert, weight 0
++        ids_c = ggml_cast(ctx0, ids_c, GGML_TYPE_I32);
++        ggml_tensor * w_h = ggml_mul(ctx0, weights, ggml_reshape_3d(ctx0, hot, 1, n_used, n_tokens));
++        ggml_tensor * w_c = ggml_sub(ctx0, weights, w_h);
++        // EDX_OVERLAP: put the cold path's inputs in the graph before the hot experts, so the CPU split that computes the
++        // cold experts does not read anything the device split of the hot experts produces, and the scheduler can run them at once
++        if (getenv("EDX_OVERLAP") != nullptr && !moe_cache->draft()) {
++            ggml_build_forward_expand(gf, ids_c);
++            ggml_build_forward_expand(gf, w_c);
++        }
++        ggml_tensor * out_h = edx_tail(cur, ids_h, ids_h, w_h);
++        if (moe_cache->draft()) {
++            return out_h; // every selected expert is pinned
++        }
++        ggml_tensor * out_c = edx_tail(cur, ids_c, nullptr, w_c);
++        ggml_tensor * out = ggml_add(ctx0, out_h, out_c);
++        cb(out, "ffn_moe_out_edx", il);
++        return out;
++    }
++    return edx_tail(cur, selected_experts, slots, weights);
+ }
+ 
+ ggml_tensor * llm_graph_context::build_moe_cache_slots(
+@@ -2630,7 +2817,7 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
+          ggml_tensor * down_exps,
+          ggml_tensor * gate_up_exps,
+                  int   il) const {
+-    if (moe_cache == nullptr) {
++    if (moe_cache == nullptr || moe_cache->steer_only()) {
+         return nullptr;
+     }
+ 

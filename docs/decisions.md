@@ -13,3 +13,7 @@
 - D-11 · llama.cpp's MoE cost measured by subtraction (EDX_NOMOE drops routed experts + router from the graph) · no profiler on the box; includes the scheduler/split overhead MoE causes, which is part of MoE's real cost · yes
 - D-12 · CPU co-processor = persistent pthreads from Mojo (abi("C") entry) polling the mailbox, over parallelize() · 1 us vs 236 us per dispatch; parallelize was 60-70% of every cold request · yes
 - D-13 · page out hot experts' file pages after their VRAM copy · without it cold experts were read from SSD (650 MB/s of faults); same as llama.cpp's EDX_PAGEOUT, so the comparison stays fair · yes
+- D-14 · integrate as a shared library called from a ggml custom op (host round trip per layer) before any in-stream / megakernel integration · smallest change that measures the real end-to-end effect; the round trip turned out cheap (~150 us/layer call total) · yes
+- D-15 · prompts through the Mojo layer token by token (OMX_PREFILL) · llama.cpp's own prompt path reads every expert from mmap and evicts the cold set (8 tok/s); token-by-token gives 112 tok/s; batched kernels are the next step · yes
+- D-16 · -lzm on (n-gram/Engram rows on demand) for the Mojo runs, and the same flags for the control · frees ~29 GB of RAM for cold experts; the control shows the flags alone don't speed llama.cpp up · yes
+- D-17 · M5 proof checks recorded runs by default (FULL=1 reruns ~30 min of server runs) · keeps scripts/check usable; the scripts that produced the numbers are in ../scripts · yes

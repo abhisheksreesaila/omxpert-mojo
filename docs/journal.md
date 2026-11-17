@@ -69,3 +69,21 @@ Every step kept the per-lane arithmetic order, so CPU/GPU stayed bit-identical t
   EDX_NOMOE 91.2 tok/s (11.0 ms) -> llama.cpp's routed MoE = 24.7 ms/token; everything else = 11.0 ms.
 - M4 PASS: Mojo MoE 8.6 ms/token (35% of 24.7) on a quiet machine (11.7 with desktop load), 19.9 cold experts/token
   served by the CPU pool in 5.4 ms. Projection if M5 adds nothing: 11.0 + 8.6 = 19.6 ms -> ~51 tok/s (today 28).
+
+## M5: end to end inside llama.cpp (PASS: 42.8 tok/s decode vs 25.9 same-flag control / 27-29 llama.cpp best; text identical across pin sets)
+- libomxmoe.so (src/omx_lib.mojo: @export C entry points, integer handle, initialize_runtime) + ~60-line hook in
+  llama.cpp build_moe_ffn (patches/llama.cpp-omx-hook.patch): dlopen OMX_LIB, a ggml custom op per layer calls
+  omx_moe(layer, x, y). llama.cpp keeps attention, linear attention, shared expert, n-gram table, sampling, server.
+- Pins for M5 had to fit beside llama.cpp (+ a 2 GB node process and the desktop): 16.3 + 15.3 GiB, 10,825 experts,
+  90.8% of held-out picks (llama.cpp baseline: 35000 MiB). Mojo runs with the SMALLER budget.
+- First run: 19 tok/s decode, 8 tok/s prompts. The Mojo MoE took 27-50 ms/token in-process (8.6 standalone):
+  -lzm off kept the 28.8 GB n-gram table resident, llama.cpp's prompt path read all experts from mmap (evicting the
+  cold ones), and llama.cpp's CPU threads spun against our 12 workers.
+- Fix (and start of C): -lzm on (n-gram rows read on demand, llama.cpp's prefetch), OMX_PREFILL=1 (prompts through
+  Mojo too, token by token, so llama.cpp never touches expert weights), -t 6 --poll 0.
+  -> 42.8 tok/s decode (35.3-47.7), 112 tok/s prompts; in-process MoE 6.7-8.8 ms/token (~150 us/layer call).
+- Control, llama.cpp pinned stack with the same flags: 25.9 tok/s decode, 227 tok/s prompts (flags don't help it).
+  Earlier same-day llama.cpp default flags: 27.2 / 28.8. => +53% to +65% decode; prompts 2x slower (token-by-token MoE).
+- Placement invariance: greedy 96 tokens x 3 prompts, pins A, A again, and B (22% hot, 68% of picks: thousands of
+  experts moved to the CPU): byte-identical text.
+- Ops lesson: T3 restarts kill setsid/nohup children; run long jobs with systemd-run --user (pass PATH/HOME).

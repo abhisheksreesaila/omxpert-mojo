@@ -18,6 +18,8 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--pin-mib", type=int, default=35000)
 ap.add_argument("--free-gb", default="21.0,18.3", help="free VRAM per GPU after dense weights (llama.cpp splits by this)")
 ap.add_argument("--tokens", type=int, default=400)
+ap.add_argument("--budget-gib", default="", help="explicit pin budget per GPU, e.g. 16.3,15.4 (overrides --pin-mib split)")
+ap.add_argument("--tag", default="", help="suffix for output files, e.g. _m5")
 a = ap.parse_args()
 os.makedirs("results", exist_ok=True)
 
@@ -37,6 +39,8 @@ files = sorted({v[k][0] for v in info.values() for k in v})
 prof = np.fromfile(PROFILE, dtype=np.float32, offset=8).reshape(L, E)
 free = [float(x) for x in a.free_gb.split(",")]
 budget = [a.pin_mib * 2**20 * f / sum(free) for f in free]
+if a.budget_gib:
+    budget = [float(x) * 2**30 for x in a.budget_gib.split(",")]
 pins = np.full((L, E), -1, dtype=np.int32)
 nhot = np.zeros(L, dtype=np.int32)
 for g, layers in enumerate([range(0, 24), range(24, 48)]):
@@ -49,16 +53,16 @@ for g, layers in enumerate([range(0, 24), range(24, 48)]):
         used += size
         pins[l, e] = nhot[l]
         nhot[l] += 1
-pins.tofile("results/pins.bin")
+pins.tofile(f"results/pins{a.tag}.bin")
 
 tr = np.load(TRACE)["topk"].astype(np.int32)
 hot_share = float((pins[np.arange(L)[None, :, None], tr] >= 0).mean())
 idx = np.linspace(0, tr.shape[0] - 1, a.tokens).astype(int)   # evenly across the held-out chats, not just the start
 sel = np.sort(tr[idx], axis=2).astype(np.int32)
 sample_share = float((pins[np.arange(L)[None, :, None], tr[idx]] >= 0).mean())
-sel.tofile("results/trace_chat.bin")
+sel.tofile(f"results/trace_chat{a.tag}.bin")
 
-with open("results/model.txt", "w") as f:
+with open(f"results/model{a.tag}.txt", "w") as f:
     f.write(" ".join(files) + "\n")
     for l in range(L):
         row = [l, 0 if l < 24 else 1, int(nhot[l])]
@@ -68,7 +72,7 @@ with open("results/model.txt", "w") as f:
         f.write(" ".join(str(x) for x in row) + "\n")
 json.dump({"pin_mib": a.pin_mib, "budget_gib": [b / 2**30 for b in budget], "hot_per_layer": nhot.tolist(),
            "pinned_experts": int(nhot.sum()), "heldout_hot_share": hot_share, "sample_hot_share": sample_share, "trace_tokens": int(sel.shape[0])},
-          open("results/pins.json", "w"), indent=1)
+          open(f"results/pins{a.tag}.json", "w"), indent=1)
 print(f"pinned {int(nhot.sum())} experts ({100*nhot.sum()/(L*E):.0f}%), held-out chat picks on the GPU: {100*hot_share:.1f}% "
       f"(the {sel.shape[0]} sampled tokens: {100*sample_share:.1f}%)")
 print("hot per layer:", nhot.tolist())

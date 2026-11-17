@@ -8,6 +8,7 @@
 from std.math import fma
 from max.gpu import block_idx, block_dim, thread_idx
 from max.gpu.sync import barrier
+from max.gpu.primitives.warp import shuffle_xor
 from max.gpu.intrinsics import threadfence, Scope
 from std.memory import unsafe_stack_allocation
 from qexperts import exp_det, Q51_BYTES, Q4K_BYTES, Q5K_BYTES, q51_block, row_dot_q80, row_dot_q5k
@@ -193,3 +194,82 @@ def wait_x_kernel(hb: Pointer[Int32, MutAnyOrigin], seq: Int32, x: Pointer[Float
     var hf = hb.bitcast[Float32]()
     for i in range(t, D_MODEL, Int(block_dim.x)):
         x[i] = hf.unsafe_load[volatile=True](64 + i)[0]
+
+
+def topk_slots_kernel(
+    logits: Pointer[Float32, ImmutAnyOrigin], res: Pointer[Int32, ImmutAnyOrigin], x: Pointer[Float32, ImmutAnyOrigin],
+    w: Pointer[Float32, MutAnyOrigin], slots: Pointer[Int32, MutAnyOrigin], mb: Pointer[Int32, MutAnyOrigin], seq: Int32,
+):
+    """Real routing (M5): top-10 of the router logits by block argmax (ties -> lower id), sorted ids, weights =
+    softmax over the 10 (llama.cpp: softmax, top-k, renormalise; this model has no extra weight scale).
+    slots[i] = VRAM slot or -1, slots[TOPK] = number of cold experts; cold ids + x posted to the mailbox."""
+    var t = Int(thread_idx.x)
+    var lane = t % 32
+    var wid = t // 32
+    var wv = unsafe_stack_allocation[16, Float32, address_space=.SHARED]()
+    var wi = unsafe_stack_allocation[16, Int32, address_space=.SHARED]()
+    var sel = unsafe_stack_allocation[TOPK, Int32, address_space=.SHARED]()
+    var v = logits[t]
+    for r in range(TOPK):
+        var bv = v
+        var bi = Int32(t)
+        comptime for off in [16, 8, 4, 2, 1]:
+            var ov = shuffle_xor(bv, UInt32(off))
+            var oi = shuffle_xor(bi, UInt32(off))
+            if ov > bv or (ov == bv and oi < bi):
+                bv = ov
+                bi = oi
+        if lane == 0:
+            wv[unsafe_offset=wid] = bv
+            wi[unsafe_offset=wid] = bi
+        barrier()
+        if t == 0:
+            var mv = wv[unsafe_offset=0][0]
+            var mi = wi[unsafe_offset=0][0]
+            for j in range(1, 16):
+                var cv = wv[unsafe_offset=j][0]
+                var ci = wi[unsafe_offset=j][0]
+                if cv > mv or (cv == mv and ci < mi):
+                    mv = cv
+                    mi = ci
+            sel[unsafe_offset=r] = mi
+        barrier()
+        if t == Int(sel[unsafe_offset=r][0]):
+            v = Float32(-3.0e38)
+        barrier()
+    if t == 0:
+        for i in range(1, TOPK):
+            var key = sel[unsafe_offset=i][0]
+            var j = i - 1
+            while j >= 0 and sel[unsafe_offset=j][0] > key:
+                sel[unsafe_offset=j + 1] = sel[unsafe_offset=j][0]
+                j -= 1
+            sel[unsafe_offset=j + 1] = key
+        var lmax = Float32(-3.0e38)
+        for i in range(TOPK):
+            lmax = max(lmax, logits[Int(sel[unsafe_offset=i][0])])
+        var tot: Float32 = 0
+        for i in range(TOPK):
+            tot += exp_det[1](SIMD[DType.float32, 1](logits[Int(sel[unsafe_offset=i][0])] - lmax))[0]
+        var ncold = 0
+        for i in range(TOPK):
+            var id = sel[unsafe_offset=i][0]
+            w[i] = exp_det[1](SIMD[DType.float32, 1](logits[Int(id)] - lmax))[0] / tot
+            var sl = res[Int(id)]
+            slots[i] = sl
+            if sl < 0:
+                mb.unsafe_store[volatile=True](MB_SLOT + ncold, Int32(i))
+                mb.unsafe_store[volatile=True](MB_ID + ncold, id)
+                ncold += 1
+        mb.unsafe_store[volatile=True](MB_NCOLD, Int32(ncold))
+        slots[TOPK] = Int32(ncold)
+    barrier()
+    if slots[TOPK] > 0:
+        var mbf = mb.bitcast[Float32]()
+        for i in range(t, D_MODEL, Int(block_dim.x)):
+            mbf.unsafe_store[volatile=True](MB_X + i, x[i])
+    threadfence[Scope.SYSTEM]()
+    barrier()
+    if t == 0:
+        threadfence[Scope.SYSTEM]()
+        mb.unsafe_store[volatile=True](MB_SEQ, seq)

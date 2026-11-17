@@ -51,6 +51,8 @@ struct PoolCtl:
     @__allow_legacy_any_origin_fields
     var ring1: Pointer[Int32, MutAnyOrigin]
     var total_steps: Int
+    @__allow_legacy_any_origin_fields
+    var steplayer: Pointer[Int, MutAnyOrigin]   # host records the layer of each step (index step & 4095); -1 = use step % nl
     # job (written by worker 0 before bumping C_GEN)
     var j_layer: Int
     var j_k: Int
@@ -85,6 +87,9 @@ struct PoolCtl:
         self.ring0 = alloc[Int32](1).as_unsafe_any_origin()
         self.ring1 = alloc[Int32](1).as_unsafe_any_origin()
         self.total_steps = 0
+        self.steplayer = alloc[Int](4096).as_unsafe_any_origin()
+        for i in range(4096):
+            self.steplayer[i] = -1
         self.j_layer = 0
         self.j_k = 0
         self.j_mb = alloc[Int32](1).as_unsafe_any_origin()
@@ -161,13 +166,23 @@ def worker_entry(arg: Pointer[PoolCtl, MutAnyOrigin]) abi("C") -> Pointer[PoolCt
     if w == 0:
         # coordinator: walk the steps in order, serve each layer's cold experts with the whole team
         for step in range(p[].total_steps):
-            var l = step % p[].nl
             var seq = Int32(step + 1)
-            var ring = p[].ring0 if p[].gpu[l] == 0 else p[].ring1
-            var mb = ring + (Int(seq) % RING) * MB_WORDS
-            while mb.unsafe_load[volatile=True](MB_SEQ)[0] != seq:
+            # the request may come from either GPU: watch both rings for this sequence number
+            var mb0 = p[].ring0 + (Int(seq) % RING) * MB_WORDS
+            var mb1 = p[].ring1 + (Int(seq) % RING) * MB_WORDS
+            var mb = mb0
+            while True:
+                if mb0.unsafe_load[volatile=True](MB_SEQ)[0] == seq:
+                    mb = mb0
+                    break
+                if mb1.unsafe_load[volatile=True](MB_SEQ)[0] == seq:
+                    mb = mb1
+                    break
                 if Atomic.load(ctl + C_STOP) != 0:
                     return arg
+            var l = p[].steplayer[step & 4095]
+            if l < 0:
+                l = step % p[].nl
             var k = Int(mb.unsafe_load[volatile=True](MB_NCOLD)[0])
             if k > 0:
                 var t0 = perf_counter_ns()
