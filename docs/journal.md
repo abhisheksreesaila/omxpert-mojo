@@ -65,3 +65,7 @@ Every step kept the per-lane arithmetic order, so CPU/GPU stayed bit-identical t
 - Cold experts were being read from the SSD (50k major faults/s, 650 MB/s): loading 35 GB of hot experts through the
   page cache evicted the cold ones. madvise(MADV_PAGEOUT) on each hot expert after its VRAM copy (= llama.cpp's
   EDX_PAGEOUT) -> no major faults in the loop -> 11.7 ms/token MoE (CPU 8.5 ms for ~20 cold experts/token).
+- llama.cpp baseline (scripts/n7_moe_cost.sh, control/candidate/control): normal 27.2 / 28.8 tok/s (35.7 ms/token),
+  EDX_NOMOE 91.2 tok/s (11.0 ms) -> llama.cpp's routed MoE = 24.7 ms/token; everything else = 11.0 ms.
+- M4 PASS: Mojo MoE 8.6 ms/token (35% of 24.7) on a quiet machine (11.7 with desktop load), 19.9 cold experts/token
+  served by the CPU pool in 5.4 ms. Projection if M5 adds nothing: 11.0 + 8.6 = 19.6 ms -> ~51 tok/s (today 28).

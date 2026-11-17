@@ -9,3 +9,7 @@
 - D-07 · gate/up: one row pair per warp with x in registers, over multi-row and split-warp variants · measured best (32.8 vs 38-47 us) · yes
 - D-08 · M2 CPU speed judged on the median of 5 runs, not one · desktop load (Chromium) moves single runs by +-1.5 GB/s; the skill's noise rule; threshold unchanged · yes
 - D-09 · keep two parallelize calls per layer for now; persistent pthread workers come with the mailbox in M3 · fused spin-barrier version was 2.8x slower with the runtime's task model · yes
+- D-10 · pins: same budget (35000 MiB) and same rule as the EDX patch (split by free VRAM, profile score order), not llama.cpp's exact per-group slot counts (not logged at this verbosity) · hit share 92.8% vs night 6's ~94% shows placement is not what makes the difference · yes
+- D-11 · llama.cpp's MoE cost measured by subtraction (EDX_NOMOE drops routed experts + router from the graph) · no profiler on the box; includes the scheduler/split overhead MoE causes, which is part of MoE's real cost · yes
+- D-12 · CPU co-processor = persistent pthreads from Mojo (abi("C") entry) polling the mailbox, over parallelize() · 1 us vs 236 us per dispatch; parallelize was 60-70% of every cold request · yes
+- D-13 · page out hot experts' file pages after their VRAM copy · without it cold experts were read from SSD (650 MB/s of faults); same as llama.cpp's EDX_PAGEOUT, so the comparison stays fair · yes

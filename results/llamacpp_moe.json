@@ -1,0 +1,8 @@
+{
+ "tps_normal_before": 27.225,
+ "tps_nomoe": 91.245,
+ "tps_normal_after": 28.845,
+ "ms_per_token_normal": 35.6696985910469,
+ "ms_per_token_nomoe": 10.959504630390706,
+ "moe_ms_per_token": 24.7101939606562
+}
