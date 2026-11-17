@@ -3,7 +3,7 @@
 from std.sys import argv
 from std.time import perf_counter_ns
 from std.memory import alloc
-from cpu_moe import moe_cpu, D_MODEL, D_FF
+from cpu_moe import moe_cpu, HV_PER_EXPERT, D_MODEL, D_FF
 
 comptime K = 10
 
@@ -50,14 +50,15 @@ def main() raises:
 
     var xp = alloc[Float32](D_MODEL)
     var h = alloc[Float32](K * D_FF)
+    var hvv = alloc[Float32](K * HV_PER_EXPERT)
     var s = alloc[Float32](K * D_MODEL)
     var y = alloc[Float32](D_MODEL)
     var q80 = a[7] == "1"
-    moe_cpu(gate, up, down, q80, off_gu, off_d, K, w, x, xp, h, s, y)
+    moe_cpu(gate, up, down, q80, off_gu, off_d, K, w, x, xp, h, hvv, s, y)
     var best = 1 << 62
     for _ in range(20):
         var t0 = perf_counter_ns()
-        moe_cpu(gate, up, down, q80, off_gu, off_d, K, w, x, xp, h, s, y)
+        moe_cpu(gate, up, down, q80, off_gu, off_d, K, w, x, xp, h, hvv, s, y)
         best = min(best, perf_counter_ns() - t0)
 
     var maxref: Float64 = 0

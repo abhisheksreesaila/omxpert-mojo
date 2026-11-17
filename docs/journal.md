@@ -26,3 +26,14 @@ Path, per-layer time for 10 experts (31 MB):
 - Same for x in gate/up: more rows per warp got SLOWER (fewer warps in flight); 1 row (gate+up) per warp with x in
   registers is best (32.8 us). Splitting gate and up onto separate warps: 44 us (worse). Array[] spilled; SIMD[64] did not.
 Every step kept the per-lane arithmetic order, so CPU/GPU stayed bit-identical throughout.
+
+## M2: same source, same bits (PASS: 1200/1200 tokens bit-identical on Q5_1 and Q8_0 layers; CPU median 16.2 GB/s = 62%)
+- Bit-identical from the first try, and through every optimisation, because only loads were specialised per device;
+  the per-lane arithmetic (fma chain order, butterfly tree, own exp) is one definition.
+- CPU speed with random routing over the full layer: 13.5 -> ~16.5 GB/s median. Probe (src/cpu_bw_probe.mojo): plain
+  sequential reads 26 GB/s; MoE pattern (10 random 3 MB pieces/token, one parallelize) 22.6 GB/s = the practical ceiling.
+- Helped: shuffle-built scale vectors, 16-byte block loads, h arranged in lane order once per expert, expert-major down
+  loop + software prefetch. Didn't: task count (12-96 all within noise of +-1.5 GB/s from desktop load).
+- Fused single parallel region with spin barriers: 5.9 GB/s (worse): parallelism_level is 24 (SMT) and spinning
+  tasks wait on workers not yet scheduled. Persistent workers need real threads (pthreads via FFI) -> M3.
+- Hot-cache CPU (same 10 experts): 28 GB/s, so math is not the limit; memory/compute overlap is.

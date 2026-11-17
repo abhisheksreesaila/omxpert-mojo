@@ -1,0 +1,6 @@
+{"cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  1839.885465 , "cpu_gbs":  16.696691497587324 }
+{"cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  1848.69028 , "cpu_gbs":  16.617169642932293 }
+{"cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  1897.4694550000002 , "cpu_gbs":  16.189983938371224 }
+{"cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  2019.266175 , "cpu_gbs":  15.213447528778616 }
+{"cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  1911.38109 , "cpu_gbs":  16.072148124056202 }
+{"layer": 4, "cases":  200 , "bit_identical_cases":  200 , "diff_floats":  0 , "cpu_us_per_token_layer":  2026.022285 , "cpu_gbs":  17.689835035550953 }

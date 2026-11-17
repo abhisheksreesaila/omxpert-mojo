@@ -13,6 +13,7 @@
 from std.math import fma, floor
 from std.memory import bitcast
 from max.gpu.primitives.warp import shuffle_idx
+from std.utils import StaticTuple
 
 comptime F32 = DType.float32
 comptime MAGIC = UInt32(0x4B000000)  # bit pattern of 2^23: (MAGIC | q) as float - 2^23 == float(q) exactly, for q < 2^23
@@ -144,14 +145,16 @@ def row_dot_q4k[W: Int, NBLK: Int](row: Pointer[UInt8, _], xp: Pointer[Float32, 
             d2[0] = shuffle_idx(my_d, UInt32(2 * j + 1))
             m2[0] = shuffle_idx(my_m, UInt32(2 * j + 1))
         else:
-            comptime for i in range(W):
-                var j = (lane0 + i) // 8
-                var lo = scale_min_k4(s0, s1, s2, 2 * j)
-                var hi = scale_min_k4(s0, s1, s2, 2 * j + 1)
-                d1[i] = d * Float32(lo[0])
-                m1[i] = dmin * Float32(lo[1])
-                d2[i] = d * Float32(hi[0])
-                m2[i] = dmin * Float32(hi[1])
+            var dd = SIMD[F32, 32](0)  # sub-block values in lanes 0..7, spread below by shuffles
+            var mm = SIMD[F32, 32](0)
+            comptime for t in range(8):
+                var sm = scale_min_k4(s0, s1, s2, t)
+                dd[t] = d * Float32(sm[0])
+                mm[t] = dmin * Float32(sm[1])
+            d1 = rebind[SIMD[F32, W]](dd.shuffle[0,0,0,0,0,0,0,0,2,2,2,2,2,2,2,2,4,4,4,4,4,4,4,4,6,6,6,6,6,6,6,6]())
+            m1 = rebind[SIMD[F32, W]](mm.shuffle[0,0,0,0,0,0,0,0,2,2,2,2,2,2,2,2,4,4,4,4,4,4,4,4,6,6,6,6,6,6,6,6]())
+            d2 = rebind[SIMD[F32, W]](dd.shuffle[1,1,1,1,1,1,1,1,3,3,3,3,3,3,3,3,5,5,5,5,5,5,5,5,7,7,7,7,7,7,7,7]())
+            m2 = rebind[SIMD[F32, W]](mm.shuffle[1,1,1,1,1,1,1,1,3,3,3,3,3,3,3,3,5,5,5,5,5,5,5,5,7,7,7,7,7,7,7,7]())
         var q = (b + 16).bitcast[UInt32]().load[width=W](lane0)
         comptime if W == 1:
             # x natural layout: lane's 4 low-nibble values and 4 high-nibble values are contiguous -> 2 vector loads
@@ -227,6 +230,11 @@ def row_dot_q51[W: Int, NBLK: Int](row: Pointer[UInt8, _], h: Pointer[Float32, _
     last block add nothing. h read from memory (the CPU path; the GPU keeps h in registers, see gpu_moe.mojo)."""
     var acc = SIMD[F32, W](0)
     comptime ITERS = (NBLK + 7) // 8
+    comptime if W == 32:
+        # here h is the arranged copy from arrange_h_q51
+        comptime for it in range(ITERS):
+            acc = rebind[SIMD[F32, W]](q51_iter_vec[NBLK, it](row, h, rebind[SIMD[F32, 32]](acc)))
+        return acc
     comptime for it in range(ITERS):
         comptime for i in range(W):
             var l = lane0 + i
@@ -236,6 +244,74 @@ def row_dot_q51[W: Int, NBLK: Int](row: Pointer[UInt8, _], h: Pointer[Float32, _
                 acc[i] = q51_block(row + blk * Q51_BYTES, p, h.load[width=4](blk * 32 + 4 * p),
                                    h.load[width=4](blk * 32 + 16 + 4 * p), acc[i])
     return acc
+
+
+@inline(.always)
+def q51_iter_vec[NBLK: Int, it: Int](row: Pointer[UInt8, _], hv: Pointer[Float32, _], acc: SIMD[F32, 32]) -> SIMD[F32, 32]:
+    """CPU: q51_block for all 32 lanes at once (lane l: block 8*it + l/4, p = l % 4). Elementwise the same operations
+    in the same order, so each lane's result equals the GPU lane's bit for bit."""
+    # 8 blocks per step: one 16-byte qs load and one 8-byte header load per block, spread to its 4 lanes by shuffles
+    var h0 = SIMD[DType.uint32, 32](0)  # per-block words in lanes 0..7, spread to 4 lanes each below
+    var qh = SIMD[DType.uint32, 32](0)
+    var q0 = SIMD[DType.uint32, 4](0)
+    var q1 = SIMD[DType.uint32, 4](0)
+    var q2 = SIMD[DType.uint32, 4](0)
+    var q3 = SIMD[DType.uint32, 4](0)
+    var q4 = SIMD[DType.uint32, 4](0)
+    var q5 = SIMD[DType.uint32, 4](0)
+    var q6 = SIMD[DType.uint32, 4](0)
+    var q7 = SIMD[DType.uint32, 4](0)
+    comptime for j in range(8):
+        comptime blk = min(8 * it + j, NBLK - 1)  # clamp: lanes past the end read a valid block, result discarded
+        var hw = (row + blk * Q51_BYTES).bitcast[UInt32]()
+        h0[j] = hw[0]
+        qh[j] = hw[1]
+        var qv = (hw + 2).load[width=4](0)
+        comptime if j == 0: q0 = qv
+        elif j == 1: q1 = qv
+        elif j == 2: q2 = qv
+        elif j == 3: q3 = qv
+        elif j == 4: q4 = qv
+        elif j == 5: q5 = qv
+        elif j == 6: q6 = qv
+        else: q7 = qv
+    var qs = q0.join(q1).join(q2.join(q3)).join(q4.join(q5).join(q6.join(q7)))
+    var h0v = h0.shuffle[0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7]()
+    var qhv = qh.shuffle[0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7]()
+    var shl = SIMD[DType.uint32, 32](0, 4, 8, 12, 0, 4, 8, 12, 0, 4, 8, 12, 0, 4, 8, 12, 0, 4, 8, 12, 0, 4, 8, 12, 0, 4, 8, 12, 0, 4, 8, 12)
+    var d = bitcast[DType.float16, 32]((h0v & 0xFFFF).cast[DType.uint16]()).cast[F32]()
+    var m = bitcast[DType.float16, 32]((h0v >> 16).cast[DType.uint16]()).cast[F32]()
+    var lo = (qs & 0x0F0F0F0F) | ((((qhv >> shl) & 0xF) * 0x00204081) & 0x01010101) << 4
+    var hi = ((qs >> 4) & 0x0F0F0F0F) | ((((qhv >> (shl + 16)) & 0xF) * 0x00204081) & 0x01010101) << 4
+    var sq = SIMD[F32, 32](0)
+    var sh = SIMD[F32, 32](0)
+    comptime for k in range(4):
+        var hk = hv.load[width=32]((it * 8 + k) * 32)
+        sq = fma(u2f[32]((lo >> UInt32(8 * k)) & 0xFF), hk, sq)
+        sh = sh + hk
+    comptime for k in range(4):
+        var hk = hv.load[width=32]((it * 8 + 4 + k) * 32)
+        sq = fma(u2f[32]((hi >> UInt32(8 * k)) & 0xFF), hk, sq)
+        sh = sh + hk
+    var new = fma(m, sh, fma(d, sq, acc))
+    comptime if 8 * it + 8 <= NBLK:
+        return new
+    var keep = SIMD[DType.bool, 32](fill=False)
+    comptime for l in range(32):
+        keep[l] = 8 * it + l // 4 < NBLK
+    return keep.select(new, acc)
+
+
+def arrange_h_q51(h: Pointer[Float32, _], hv: Pointer[mut=True, Float32, _], nblk: Int):
+    """CPU: lane-order copy of one expert's h for q51_iter_vec: hv[(it*8 + j)*32 + l] = the value lane l multiplies at
+    step j (j < 4: element 4p+j, else 16+4p+(j-4); block 8*it + l/4, clamped). A pure copy, done once per expert."""
+    for it in range((nblk + 7) // 8):
+        for l in range(32):
+            var blk = min(8 * it + l // 4, nblk - 1)
+            var pp = l % 4
+            for j in range(4):
+                hv[(it * 8 + j) * 32 + l] = h[blk * 32 + 4 * pp + j]
+                hv[(it * 8 + 4 + j) * 32 + l] = h[blk * 32 + 16 + 4 * pp + j]
 
 
 @inline(.always)
