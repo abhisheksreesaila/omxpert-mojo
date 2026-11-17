@@ -13,21 +13,25 @@ ap.add_argument("--seed", type=int, default=0); a = ap.parse_args()
 os.makedirs("results", exist_ok=True)
 
 want = {f"blk.{a.layer}.ffn_{k}_exps.weight": k for k in ("gate", "up", "down")}
+want[f"blk.{a.layer}.ffn_gate_inp.weight"] = "router"
 found = {}
 for path in sorted(glob.glob(f"{MODEL}/*.gguf")):
     r = GGUFReader(path)
     for t in r.tensors:
         if t.name in want:
             found[want[t.name]] = (path, t)
-assert len(found) == 3, found.keys()
+assert len(found) == 4, found.keys()
 
 man = {"layer": a.layer, "n_experts": 512, "top_k": 10, "d_model": 2560, "d_ff": 640}
 for k, (path, t) in found.items():
+    if k == "router":
+        man[k] = {"file": path, "offset": int(t.data_offset), "type": t.tensor_type.name, "shape": [int(s) for s in t.shape]}
+        continue
     n_exp_bytes = int(t.n_bytes) // 512
     man[k] = {"file": path, "offset": int(t.data_offset), "type": t.tensor_type.name, "shape": [int(s) for s in t.shape],
               "expert_bytes": n_exp_bytes, "row_bytes": n_exp_bytes // int(t.shape[1])}
 json.dump(man, open(f"results/layer{a.layer}.json", "w"), indent=1)
-print(json.dumps({k: (v["type"], v["row_bytes"]) for k, v in man.items() if isinstance(v, dict)}))
+print(json.dumps({k: (v["type"], v.get("row_bytes")) for k, v in man.items() if isinstance(v, dict)}))
 
 def expert(k, e):
     path, t = found[k]

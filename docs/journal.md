@@ -37,3 +37,14 @@ Every step kept the per-lane arithmetic order, so CPU/GPU stayed bit-identical t
 - Fused single parallel region with spin barriers: 5.9 GB/s (worse): parallelism_level is 24 (SMT) and spinning
   tasks wait on workers not yet scheduled. Persistent workers need real threads (pthreads via FFI) -> M3.
 - Hot-cache CPU (same 10 experts): 28 GB/s, so math is not the limit; memory/compute overlap is.
+
+## M3: hybrid layer (PASS: 400/400 tokens bit-identical to all-GPU, layers 10 and 4; no host sync per layer)
+- Mojo mailbox probe (src/mailbox_probe.mojo): pinned host buffers are directly GPU-addressable; volatile store +
+  threadfence[SYSTEM] then spin: 2.06 us round trip (same as the CUDA C probe).
+- Routing (llama.cpp qwen4exp): softmax over 512, top-10, renormalise -> w = exp(l - lmax) / sum over the top-10.
+- First run hung: when a token has no cold experts the GPU doesn't wait, races ahead and overwrote the single mailbox
+  before the CPU read it. Fix: a ring of 16 mailbox slots (> the 8-token enqueue window), slot = seq % 16.
+- Latency per token-layer: all-GPU 85-101 us (router 5 MB F32 read + top-k + experts + combine). Hybrid with ~1 cold
+  expert per token: 470-580 us. The CPU request path costs ~0.4 ms for one 3 MB expert (memory alone ~0.19 ms):
+  2 parallelize dispatches, serial permute/arrange, copies. Next: persistent CPU workers (pthreads) + split one cold
+  expert's rows across all cores without per-request dispatch.

@@ -1,0 +1,2 @@
+{"layer": 10, "tokens":  200 , "bit_identical":  200 , "all_gpu_us":  91.32295500000001 , "hybrid_us":  584.4336850000001 , "cold_pct":  10 , "cold_hist": " 69 83 35 11 2 0 0 0 0 0 0 "}
+{"layer": 4, "tokens":  200 , "bit_identical":  200 , "all_gpu_us":  100.53477000000001 , "hybrid_us":  471.92686 , "cold_pct":  10 , "cold_hist": " 99 77 21 3 0 0 0 0 0 0 0 "}
