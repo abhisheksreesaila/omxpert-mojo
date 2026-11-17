@@ -3,6 +3,8 @@
 # layer 4: Q4_K + Q8_0), and the CPU reads at >= 60% of measured RAM bandwidth (26 GB/s -> 15.6), median of 5 runs of
 # 200 random routings over the whole 1.57 GB layer (25x the L3, so RAM speed, not cache).
 set -e; cd "$(dirname "$0")/.."
+# timing is only meaningful on a quiet machine: wait (load < 3 for 3 min), as the llama.cpp benchmarks do
+bash ../scripts/wait_quiet.sh
 for L in 10 4; do [ -f results/layer$L.json ] || pixi run python tools/extract.py --layer $L --cases 1 > /dev/null; done
 pixi run mojo build -I src src/test_m2.mojo -o build/test_m2 2>&1 | grep -E ' error' && exit 1
 : > results/m2.jsonl

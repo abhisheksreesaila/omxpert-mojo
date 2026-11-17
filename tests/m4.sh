@@ -3,6 +3,8 @@
 # for the hot set under llama.cpp's 35000 MiB budget. MoE ms/token must be <= 70% of llama.cpp pinned stack's routed-MoE
 # ms/token (measured by scripts/n7_moe_cost.sh: normal minus EDX_NOMOE, controls on both sides).
 set -e; cd "$(dirname "$0")/.."
+# timing is only meaningful on a quiet machine: wait (load < 3 for 3 min), as the llama.cpp benchmarks do
+bash ../scripts/wait_quiet.sh
 [ -f results/model.txt ] || pixi run python tools/build_model.py > /dev/null
 [ -f results/llamacpp_moe.json ] || pixi run python tools/llama_moe_cost.py > /dev/null
 pixi run mojo build -I src src/test_m4.mojo -o build/test_m4 2>&1 | grep -E ' error' && exit 1

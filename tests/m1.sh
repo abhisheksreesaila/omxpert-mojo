@@ -2,6 +2,8 @@
 # M1: one real layer (10) of Qwen3.8-Flash-Next on the GPU: rel. error vs float64 reference <= 1e-3 and the expert bytes
 # read at >= 50% of measured VRAM bandwidth (838 GB/s -> 419 GB/s), timed over 256 random top-10 routings.
 set -e; cd "$(dirname "$0")/.."
+# timing is only meaningful on a quiet machine: wait (load < 3 for 3 min), as the llama.cpp benchmarks do
+bash ../scripts/wait_quiet.sh
 [ -f results/layer10.json ] || pixi run python tools/extract.py --layer 10 --cases 1 > /dev/null
 pixi run mojo build -I src src/test_gpu.mojo -o build/test_gpu 2>&1 | grep -E ' error' && exit 1
 out=$(pixi run python tools/run_case.py build/test_gpu 10 0 results/gpu_l10_c0.bin)
