@@ -66,8 +66,8 @@ svg .soft{fill:var(--soft)}
 <div class="wrap">
   <header class="hero">
     <div class="eyebrow">omxpert · Qwen3.8-Flash-Next · 2× RTX 3090 · notes from 16–17 Nov 2026</div>
-    <h1>A 125B model on a desktop, <em>1.5–1.7× faster</em> — frame by frame</h1>
-    <p class="lede">What a token goes through inside a mixture-of-experts transformer, why llama.cpp spent most of its time on one part of it, and the ~2,700 lines of Mojo that replaced that part. <b>about 50 tok/s instead of 26–32</b>, with output that stays bit-identical wherever each expert runs.</p>
+    <h1>Can a 125B model run well on a desktop if it learns <em>your</em> experts?</h1>
+    <p class="lede">An open experiment, frame by frame: what a token goes through inside a mixture-of-experts transformer, why llama.cpp spent most of its time on one part of it, and ~2,700 lines of Mojo we're trying in its place. What we've seen so far, on one machine and one person's chats:</p>
     <div class="stat" aria-label="Findings">
       <div><b>49–54</b><span>tok/s decode, short chat<br>(llama.cpp 32)</span></div>
       <div><b>38</b><span>tok/s after a 25K prompt<br>(llama.cpp 27)</span></div>
@@ -76,14 +76,14 @@ svg .soft{fill:var(--soft)}
       <div><b>0 bits</b><span>differ, CPU vs GPU<br>and with or without graphs</span></div>
     </div>
     <ul class="finds">
-      <li><b>Your profile decides what lives on the GPU.</b> Half the experts serve 93% of your picks; a generic coding profile covered 44%.</li>
+      <li><b>A personal profile decides what lives on the GPU.</b> Half the experts serve 93% of my picks; a generic coding profile covered 44%.</li>
       <li><b>The cost was coordination, not math.</b> llama.cpp spent 70% of each token on experts while the GPUs idled; a Mojo expert layer with a GPU↔CPU mailbox cut that from 24.7 to about 9 ms.</li>
-      <li><b>Never stop the GPU.</b> Running Mojo's kernels inside llama.cpp's own GPU queue, with CUDA graphs on, took decode from 42 to 48 tok/s; the VRAM it freed held 1,700 more hot experts (54 tok/s).</li>
-      <li><b>Speculation doesn't pay here yet.</b> Each extra token routes to new cold experts, so checking 3 drafted tokens costs 2.4× the work. It should start paying once ~96% of picks are hot.</li>
+      <li><b>Promising: never stop the GPU.</b> Running Mojo's kernels inside llama.cpp's own GPU queue, with CUDA graphs on, took decode from 42 to 48 tok/s; the VRAM it freed held 1,700 more hot experts (54 tok/s).</li>
+      <li><b>Speculation hasn't paid here yet.</b> Each extra token routes to new cold experts, so checking 3 drafted tokens costs 2.4× the work. It should start paying once ~96% of picks are hot.</li>
     </ul>
     <div class="cta">
       <a class="btn" href="token.html"><svg class="iso" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2l7 4v8l-7 4-7-4V6z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3 6l7 4 7-4M10 10v8" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>Diagram 1: one token through the model</a>
-      <a class="btn" href="layer.html"><svg class="iso" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2l7 4v8l-7 4-7-4V6z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3 6l7 4 7-4M10 10v8" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>Diagram 2: one MoE layer on your hardware</a>
+      <a class="btn" href="layer.html"><svg class="iso" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2l7 4v8l-7 4-7-4V6z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3 6l7 4 7-4M10 10v8" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>Diagram 2: one MoE layer on this hardware</a>
     </div>
   </header>
 
@@ -94,7 +94,7 @@ svg .soft{fill:var(--soft)}
       <section class="frame" id="f1">
         <div><div class="num">FRAME 01 · THE PROBLEM</div>
           <h2>The model is bigger than the graphics cards</h2>
-          <p>Qwen3.8-Flash-Next has 125 billion parameters plus a 51-billion-entry n-gram table. At 4 bits that is a <span class="k">111 GB</span> file. Your two RTX 3090s hold <span class="k">48 GB</span>. RAM holds 62 GB, and your desktop uses some of both.</p>
+          <p>Qwen3.8-Flash-Next has 125 billion parameters plus a 51-billion-entry n-gram table. At 4 bits that is a <span class="k">111 GB</span> file. The two RTX 3090s hold <span class="k">48 GB</span>. RAM holds 62 GB, and the desktop uses some of both.</p>
           <p>Graphics memory is fast (838 GB/s per card); RAM is about 30× slower (26 GB/s). Everything below is about deciding which bytes live where.</p>
         </div>
         <div class="fig">
@@ -130,9 +130,9 @@ svg .soft{fill:var(--soft)}
       </section>
 
       <section class="frame" id="f4">
-        <div><div class="num">FRAME 04 · YOUR EXPERTS</div>
-          <h2>Your conversations use a small part of the model</h2>
-          <p>We ran the model over your own chat history and counted which experts fired. About <b>half the experts serve 93% of your picks</b>. Those go on the graphics cards: the <span class="hot">hot</span> set. The rest, the <span class="cold">cold</span> set, stay in RAM and run on the CPU when needed.</p>
+        <div><div class="num">FRAME 04 · MY EXPERTS</div>
+          <h2>My conversations use a small part of the model</h2>
+          <p>We ran the model over my own chat history and counted which experts fired. About <b>half the experts serve 93% of my picks</b>. Those go on the graphics cards: the <span class="hot">hot</span> set. The rest, the <span class="cold">cold</span> set, stay in RAM and run on the CPU when needed.</p>
           <p>A profile from someone else's work (a coding corpus) covered only 44%. The profile has to be yours.</p>
         </div>
         <div class="fig">
@@ -231,7 +231,7 @@ svg .soft{fill:var(--soft)}
         <div><div class="num">FRAME 12 · WHAT DIDN'T WORK</div>
           <h2>Two honest limits</h2>
           <p><b>Short prompts trailed:</b> batching took them from 112 to 180–190 tok/s, but llama.cpp does 224. Long prompts beat it, because big chunks upload their busiest cold experts to the GPU while the CPU takes the rest. <span class="tag ok">fixed next day, frame 14</span></p>
-          <p><b>A guess that failed:</b> we expected back-to-back tokens to reuse cold experts, so checking several drafted tokens at once would be cheap. Your trace says no: 5 tokens need 3.6× the cold experts of one. The hot set is personal; the cold picks are a scattered long tail. <span class="tag bad">milestone 6 falsified</span></p>
+          <p><b>A guess that failed:</b> we expected back-to-back tokens to reuse cold experts, so checking several drafted tokens at once would be cheap. My trace says no: 5 tokens need 3.6× the cold experts of one. The hot set is personal; the cold picks are a scattered long tail. <span class="tag bad">milestone 6 falsified</span></p>
         </div>
         <div class="fig">
           <svg viewBox="0 0 520 220" role="img" aria-label="Distinct cold experts grow almost linearly with batch size" id="unionSvg"></svg>
@@ -255,7 +255,7 @@ svg .soft{fill:var(--soft)}
       <section class="frame" id="f14">
         <div><div class="num">FRAME 14 · THE RESULT, AGAIN</div>
           <h2>50 tokens per second, and faster at full context</h2>
-          <p>The new path left about 4 GB idle on each card. It now holds <b>1,700 more hot experts</b>: 92% of your picks land on the GPUs, up from 88%, so the CPU has a third less to do.</p>
+          <p>The new path left about 4 GB idle on each card. It now holds <b>1,700 more hot experts</b>: 92% of my picks land on the GPUs, up from 88%, so the CPU has a third less to do.</p>
           <p>Back to back against the previous night's setup: short chat <b>49–54 vs 41 tok/s</b>, decode after a 25,000-token prompt <b>38 vs 30</b>, short prompts <b>221–258 vs 189</b> (llama.cpp: 224). The code hidden at 26,500 tokens is still found.</p>
           <p>Greedy text stays byte-identical across the old path, the new path and the bigger hot set. <span class="tag ok">same output</span></p>
         </div>
@@ -280,7 +280,7 @@ svg .soft{fill:var(--soft)}
     </main>
   </div>
 
-  <footer>Code, logs and every number: <span class="k">~/Projects/expert-dispatch/omxpert-mojo</span> (docs/journal.md, docs/decisions.md). Click blocks and press Play in the two diagrams.</footer>
+  <footer>Code, logs and every number: <a href="https://github.com/abhisheksreesaila/omxpert-mojo">github.com/abhisheksreesaila/omxpert-mojo</a> (docs/journal.md, docs/decisions.md). Ideas and results from other machines welcome: <a href="https://github.com/abhisheksreesaila/omxpert-mojo/issues">open an issue</a>. Click blocks and press Play in the two diagrams.</footer>
 </div>
 
 <script>
