@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>One token through Qwen3.8-Flash-Next</title>
 <style>
+@font-face { font-family: "Geist"; src: url(fonts/geist-variable.woff2) format("woff2"); font-weight: 100 900; font-display: swap; }
+@font-face { font-family: "Geist Mono"; src: url(fonts/geist-mono-variable.woff2) format("woff2"); font-weight: 100 900; font-display: swap; }
 :root{
   --bg:#f5f3ee; --ink:#1d1f25; --muted:#6a6e78; --panel:#fffffff0; --line:#dcd8ce;
   --chip:#ffffff; --accent:#3d5bd9; --bug:#e5484d; --shadow:0 8px 30px #00000014; --r:999px;
@@ -101,11 +103,22 @@ footer[hidden]{display:none}
   #info,#info.wide{left:12px;right:12px;width:auto;top:auto;bottom:12px;max-height:55%}
   #legend{display:none}
 }
+
+/* omxpert theme: black, Geist, gold, whatever drawing style or theme is picked */
+:root, :root[data-theme], :root[data-style], :root[data-style][data-theme], :root[data-style]:not([data-theme="light"]) {
+  --bg: #000 !important; --ink: #f5f5f7 !important; --muted: #a1a1a6 !important; --panel: #0e0e10f2 !important; --line: #2c2c31 !important;
+  --chip: #161618 !important; --accent: #f5c451 !important; --bug: #ff7a85 !important; --shadow: 0 10px 40px #000a !important;
+  --font: "Geist", system-ui, sans-serif !important; color-scheme: dark; }
+html, body { background: #000; }
+body { background-image: none !important; }   /* the paper grain reads as speckle on black */
+#bTheme { display: none !important; }
+.omxback { display: inline-flex; align-items: center; gap: 8px; font: 600 11px "Geist Mono", ui-monospace, monospace; letter-spacing: .12em; text-transform: uppercase; color: #f5c451; text-decoration: none; margin-bottom: 4px; }
+.omxback:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
 <header>
-  <div class="t"><h1 id="title"></h1><p class="sub" id="subtitle"></p></div>
+  <div class="t"><a class="omxback" href="index.html">omxpert · Mojo explainer</a><h1 id="title"></h1><p class="sub" id="subtitle"></p></div>
   <div class="tools">
     <select id="styleSel" aria-label="Drawing style" title="Drawing style">
       <option value="fieldnotes">Field notes</option>
